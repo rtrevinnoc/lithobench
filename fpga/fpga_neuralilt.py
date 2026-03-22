@@ -30,6 +30,7 @@ import torch.optim.lr_scheduler as lr_sched
 from torch.utils.data import DataLoader
 
 from pycommon.settings import REALTYPE, DEVICE
+import pylitho.exact as litho
 from lithobench.model import ModelILT
 from fpga.mini_unet import MiniUNet
 from fpga.tiled_inference import TiledInference
@@ -51,6 +52,7 @@ class FPGANeuralILT(ModelILT):
 
     def __init__(self, size=(512, 512), tile_size=64, overlap=16):
         super().__init__(size=size, name="FPGANeuralILT")
+        self.simLitho = litho.LithoSim("./config/lithosimple.txt")
         self.net = MiniUNet()
         if torch.cuda.is_available():
             self.net = self.net.cuda()
@@ -107,13 +109,76 @@ class FPGANeuralILT(ModelILT):
                 sched.step()
 
     def train(self, train_loader, val_loader, epochs=1, batch_size=4):
-        """Training phase — same as pretrain for MiniUNet (no litho sim).
+        """Physics-informed training using the lithography simulator.
 
-        The full NeuralILT uses a lithography simulator in training, but
-        running litho sim on individual tiles is not meaningful due to
-        boundary effects. Instead, we continue supervised training.
+        For each full-size target image:
+          1. Run MiniUNet on all tiles (differentiably)
+          2. Reassemble into a full 512x512 mask
+          3. Run litho sim on the full mask
+          4. Backpropagate physics loss through tiling back to MiniUNet
+
+        This matches the original NeuralILT training loop
+        (neuralilt.py:171-221) where the loss is:
+          l2loss  = MSE(printedNom, target)
+          cpxloss = MSE(printedMax, printedMin)
         """
-        self.pretrain(train_loader, val_loader, epochs=epochs, batch_size=batch_size)
+        opt = optim.Adam(self.net.parameters(), lr=1e-3)
+        sched = lr_sched.StepLR(opt, 1, gamma=0.1)
+        device = next(self.net.parameters()).device
+
+        for epoch in range(epochs):
+            print(f"[Epoch {epoch}] Training (physics-informed)")
+            self.net.train()
+            progress = tqdm(train_loader)
+            for target, label in progress:
+                if torch.cuda.is_available():
+                    target = target.cuda()
+
+                # Process one image at a time through full tiled pipeline
+                for b in range(target.shape[0]):
+                    img = target[b : b + 1]  # (1, 1, H, W)
+
+                    # Differentiable tiled forward: tiles -> MiniUNet -> reassemble
+                    mask_full = self.tiler.forward(img, self.net, batch_size=64)
+                    # mask_full: (1, 1, 512, 512) with gradients
+
+                    # Run lithography simulator on the full assembled mask
+                    mask_sq = mask_full.squeeze(1)  # (1, 512, 512)
+                    printedNom, printedMax, printedMin = self.simLitho(mask_sq)
+
+                    l2loss = F.mse_loss(printedNom.unsqueeze(1), img)
+                    cpxloss = F.mse_loss(printedMax, printedMin)
+                    loss = l2loss + cpxloss
+
+                    opt.zero_grad()
+                    loss.backward()
+                    opt.step()
+
+                progress.set_postfix(l2=l2loss.item(), cpx=cpxloss.item())
+
+            print(f"[Epoch {epoch}] Validation")
+            self.net.eval()
+            l2losses = []
+            cpxlosses = []
+            progress = tqdm(val_loader)
+            for target, label in progress:
+                with torch.no_grad():
+                    if torch.cuda.is_available():
+                        target = target.cuda()
+                    for b in range(target.shape[0]):
+                        img = target[b : b + 1]
+                        mask_full = self.tiler.forward(img, self.net, batch_size=64)
+                        mask_sq = mask_full.squeeze(1)
+                        printedNom, printedMax, printedMin = self.simLitho(mask_sq)
+                        l2loss = F.mse_loss(printedNom.unsqueeze(1), img)
+                        cpxloss = F.mse_loss(printedMax, printedMin)
+                        l2losses.append(l2loss.item())
+                        cpxlosses.append(cpxloss.item())
+                    progress.set_postfix(l2=l2loss.item(), cpx=cpxloss.item())
+            print(f"[Epoch {epoch}] L2={np.mean(l2losses):.6f} cpx={np.mean(cpxlosses):.6f}")
+
+            if epoch == epochs // 2:
+                sched.step()
 
     def run(self, target):
         """Process a full-size target image via tiled MiniUNet inference.

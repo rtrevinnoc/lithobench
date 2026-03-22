@@ -26,7 +26,9 @@ from torch.utils.data import DataLoader, Dataset
 from pycommon.settings import REALTYPE, DEVICE
 from lithobench.dataset import loadersILT
 from lithobench.ilt.neuralilt import UNet
+import pylitho.exact as litho
 from fpga.mini_unet import MiniUNet
+from fpga.tiled_inference import TiledInference
 
 
 class TileCropDataset(Dataset):
@@ -160,6 +162,57 @@ def validate(student, loader, device):
     return total_loss / max(count, 1)
 
 
+def physics_epoch(student, tiler, sim, loader, optimizer, device):
+    """Run one epoch of physics-informed training using the litho simulator.
+
+    For each full-size target image:
+      1. Run MiniUNet on all tiles (differentiably via tiler.forward)
+      2. Reassemble into a full mask
+      3. Run litho sim on the assembled mask
+      4. Backprop: litho loss -> reassembly -> tiles -> MiniUNet weights
+
+    This is the same physics loss used in the original NeuralILT
+    (neuralilt.py:185-188):
+      l2loss  = MSE(printedNom, target)   — print fidelity
+      cpxloss = MSE(printedMax, printedMin) — process variation robustness
+    """
+    student.train()
+    total_l2 = 0.0
+    total_cpx = 0.0
+    count = 0
+    progress = tqdm(loader, desc="Physics")
+
+    for target, _label in progress:
+        target = target.to(device)
+
+        # Process one image at a time (full tiled pipeline is memory-intensive)
+        for b in range(target.shape[0]):
+            img = target[b : b + 1]  # (1, 1, H, W)
+
+            # Differentiable tiled forward pass
+            mask_full = tiler.forward(img, student, batch_size=64)
+
+            # Litho simulation on the assembled full-size mask
+            mask_sq = mask_full.squeeze(1)  # (1, H, W)
+            printedNom, printedMax, printedMin = sim(mask_sq)
+
+            l2loss = F.mse_loss(printedNom.unsqueeze(1), img)
+            cpxloss = F.mse_loss(printedMax, printedMin)
+            loss = l2loss + cpxloss
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_l2 += l2loss.item()
+            total_cpx += cpxloss.item()
+            count += 1
+
+        progress.set_postfix(l2=l2loss.item(), cpx=cpxloss.item())
+
+    return total_l2 / max(count, 1), total_cpx / max(count, 1)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train MiniUNet via knowledge distillation")
     parser.add_argument("--benchmark", "-s", default="MetalSet", type=str)
@@ -172,6 +225,8 @@ def main():
     parser.add_argument("--lr", default=1e-3, type=float)
     parser.add_argument("--alpha", default=0.7, type=float,
                         help="Distillation weight (0=GT only, 1=teacher only)")
+    parser.add_argument("--physics_epochs", "-p", default=4, type=int,
+                        help="Epochs of physics-informed training after distillation (0 to skip)")
     parser.add_argument("--output", "-o", default="saved/fpga", type=str)
     parser.add_argument("--njobs", "-j", default=8, type=int)
     args = parser.parse_args()
@@ -241,6 +296,34 @@ def main():
             save_path = os.path.join(args.output, "mini_unet_best.pth")
             torch.save(student.state_dict(), save_path)
             print(f"  Saved best model to {save_path}")
+
+    # ------------------------------------------------------------------ #
+    # Phase 2: Physics-informed training with lithography simulator
+    # ------------------------------------------------------------------ #
+    if args.physics_epochs > 0:
+        print(f"\n=== Phase 2: Physics-informed training ({args.physics_epochs} epochs) ===")
+        print("Loading lithography simulator...")
+        sim = litho.LithoSim("./config/lithosimple.txt")
+        tiler = TiledInference(tile_size=args.tile_size, overlap=16, image_size=512)
+
+        # Full-size image loaders (batch_size=1 since tiled pipeline is per-image)
+        physics_optimizer = optim.Adam(student.parameters(), lr=args.lr * 0.1)
+        physics_scheduler = lr_sched.StepLR(physics_optimizer, 1, gamma=0.1)
+
+        for epoch in range(args.physics_epochs):
+            l2_avg, cpx_avg = physics_epoch(
+                student, tiler, sim, train_loader_full,
+                physics_optimizer, device,
+            )
+            print(f"[Physics Epoch {epoch}] L2={l2_avg:.6f} cpx={cpx_avg:.6f}")
+
+            # Save after each physics epoch
+            save_path = os.path.join(args.output, "mini_unet_best.pth")
+            torch.save(student.state_dict(), save_path)
+            print(f"  Saved to {save_path}")
+
+            if epoch == args.physics_epochs // 2:
+                physics_scheduler.step()
 
     # Save final checkpoint
     final_path = os.path.join(args.output, "mini_unet_final.pth")

@@ -62,40 +62,72 @@ class TiledInference:
         """Reassemble processed tiles into a full-size output image.
 
         Only the central (stride x stride) region of each tile is kept,
-        discarding the overlap border.
+        discarding the overlap border.  This implementation uses only
+        slicing, permute and reshape, so it is fully differentiable and
+        supports autograd back-propagation through the reassembly.
 
         Args:
             tile_outputs: Tensor of shape (N, 1, tile_size, tile_size).
-            positions: List of (row_idx, col_idx) grid positions.
+            positions: List of (row_idx, col_idx) grid positions (unused
+                       when tiles are in row-major order, kept for API
+                       compatibility).
 
         Returns:
             output: Tensor of shape (1, 1, image_size, image_size).
         """
-        output = torch.zeros(
-            1, 1, self.image_size, self.image_size,
-            dtype=tile_outputs.dtype,
-            device=tile_outputs.device,
-        )
+        n = self.num_tiles_per_side  # 16
 
-        for idx, (i, j) in enumerate(positions):
-            crop = tile_outputs[
-                idx : idx + 1,
-                :,
-                self.overlap : self.tile_size - self.overlap,
-                self.overlap : self.tile_size - self.overlap,
-            ]
-            r = i * self.stride
-            c = j * self.stride
-            output[:, :, r : r + self.stride, c : c + self.stride] = crop
+        # Centre-crop each tile: (N, 1, stride, stride)
+        crops = tile_outputs[
+            :, :,
+            self.overlap : self.tile_size - self.overlap,
+            self.overlap : self.tile_size - self.overlap,
+        ]
+
+        # Reshape to grid layout: (n_row, n_col, 1, stride, stride)
+        crops = crops.reshape(n, n, 1, self.stride, self.stride)
+
+        # Interleave rows and columns:
+        #   (n_row, n_col, C, sh, sw) -> (C, n_row, sh, n_col, sw)
+        crops = crops.permute(2, 0, 3, 1, 4).contiguous()
+
+        # Merge spatial dims: (1, 1, image_size, image_size)
+        output = crops.reshape(1, 1, n * self.stride, n * self.stride)
 
         return output
 
+    def forward(self, image, model, batch_size=64):
+        """Differentiable tiled forward pass — keeps gradients for training.
+
+        Tiles are extracted, processed through the model, and reassembled.
+        All operations support autograd so gradients flow from the
+        reassembled output back through every tile and the model weights.
+
+        Args:
+            image: Tensor of shape (1, 1, H, W) on the model's device.
+            model: nn.Module mapping (B, 1, tile, tile) -> (B, 1, tile, tile).
+            batch_size: Tiles per forward pass (controls peak memory).
+
+        Returns:
+            output: Tensor of shape (1, 1, image_size, image_size), with grad.
+        """
+        tiles, positions = self.extract_tiles(image)
+        all_outputs = []
+
+        for start in range(0, tiles.shape[0], batch_size):
+            batch = tiles[start : start + batch_size]
+            out = model(batch)
+            all_outputs.append(out)
+
+        tile_outputs = torch.cat(all_outputs, dim=0)
+        return self.reassemble(tile_outputs, positions)
+
     def run(self, image, model, batch_size=64, device=None):
-        """Run tiled inference end-to-end.
+        """Non-differentiable tiled inference (no gradients, for deployment).
 
         Args:
             image: Tensor of shape (1, 1, H, W).
-            model: A callable (nn.Module) that maps (B, 1, tile, tile) -> (B, 1, tile, tile).
+            model: A callable mapping (B, 1, tile, tile) -> (B, 1, tile, tile).
             batch_size: Number of tiles to process per forward pass.
             device: Device to run inference on. If None, uses image's device.
 
