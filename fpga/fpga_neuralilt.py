@@ -14,6 +14,7 @@ Standalone:
     mask = model.run(target_512x512)
 """
 
+import glob
 import os
 import sys
 sys.path.append(".")
@@ -60,17 +61,32 @@ class FPGANeuralILT(ModelILT):
             tile_size=tile_size, overlap=overlap, image_size=size[0]
         )
 
-    def pretrain(self, train_loader, val_loader, epochs=1, batch_size=4):
+    def pretrain(self, train_loader, val_loader, epochs=1, batch_size=4,
+                 checkpoint_dir=None, resume_checkpoint=None):
         """Supervised pretraining on full-size images using tiled crops.
 
         For each full-size (target, mask) pair, random tile crops are extracted
         and the MiniUNet is trained with MSE loss.
+
+        Args:
+            checkpoint_dir: If set, save checkpoint_latest.pth here after each epoch.
+            resume_checkpoint: Path to a checkpoint to resume from.
         """
         opt = optim.Adam(self.net.parameters(), lr=1e-3)
         sched = lr_sched.StepLR(opt, 1, gamma=0.1)
         tile_size = self.tiler.tile_size
+        start_epoch = 0
 
-        for epoch in range(epochs):
+        if resume_checkpoint and os.path.exists(resume_checkpoint):
+            ckpt = torch.load(resume_checkpoint, map_location="cpu")
+            self.net.load_state_dict(ckpt["model_state"])
+            opt.load_state_dict(ckpt["optimizer_state"])
+            if ckpt.get("scheduler_state") is not None:
+                sched.load_state_dict(ckpt["scheduler_state"])
+            start_epoch = ckpt["epoch"] + 1
+            print(f"[FPGANeuralILT] Resumed pretrain from epoch {start_epoch}")
+
+        for epoch in range(start_epoch, epochs):
             print(f"[Pre-Epoch {epoch}] Training")
             self.net.train()
             progress = tqdm(train_loader)
@@ -108,7 +124,20 @@ class FPGANeuralILT(ModelILT):
             if epoch == epochs // 2:
                 sched.step()
 
-    def train(self, train_loader, val_loader, epochs=1, batch_size=4):
+            if checkpoint_dir:
+                os.makedirs(checkpoint_dir, exist_ok=True)
+                ckpt_path = os.path.join(checkpoint_dir, "checkpoint_latest.pth")
+                torch.save({
+                    "epoch": epoch,
+                    "phase": "pretrain",
+                    "model_state": self.net.state_dict(),
+                    "optimizer_state": opt.state_dict(),
+                    "scheduler_state": sched.state_dict(),
+                    "best_val": float("inf"),
+                }, ckpt_path)
+
+    def train(self, train_loader, val_loader, epochs=1, batch_size=4,
+              checkpoint_dir=None, resume_checkpoint=None):
         """Physics-informed training using the lithography simulator.
 
         For each full-size target image:
@@ -121,12 +150,26 @@ class FPGANeuralILT(ModelILT):
         (neuralilt.py:171-221) where the loss is:
           l2loss  = MSE(printedNom, target)
           cpxloss = MSE(printedMax, printedMin)
+
+        Args:
+            checkpoint_dir: If set, save checkpoint_latest.pth here after each epoch.
+            resume_checkpoint: Path to a checkpoint to resume from.
         """
         opt = optim.Adam(self.net.parameters(), lr=1e-3)
         sched = lr_sched.StepLR(opt, 1, gamma=0.1)
         device = next(self.net.parameters()).device
+        start_epoch = 0
 
-        for epoch in range(epochs):
+        if resume_checkpoint and os.path.exists(resume_checkpoint):
+            ckpt = torch.load(resume_checkpoint, map_location="cpu")
+            self.net.load_state_dict(ckpt["model_state"])
+            opt.load_state_dict(ckpt["optimizer_state"])
+            if ckpt.get("scheduler_state") is not None:
+                sched.load_state_dict(ckpt["scheduler_state"])
+            start_epoch = ckpt["epoch"] + 1
+            print(f"[FPGANeuralILT] Resumed train from epoch {start_epoch}")
+
+        for epoch in range(start_epoch, epochs):
             print(f"[Epoch {epoch}] Training (physics-informed)")
             self.net.train()
             progress = tqdm(train_loader)
@@ -179,6 +222,18 @@ class FPGANeuralILT(ModelILT):
 
             if epoch == epochs // 2:
                 sched.step()
+
+            if checkpoint_dir:
+                os.makedirs(checkpoint_dir, exist_ok=True)
+                ckpt_path = os.path.join(checkpoint_dir, "checkpoint_latest.pth")
+                torch.save({
+                    "epoch": epoch,
+                    "phase": "physics",
+                    "model_state": self.net.state_dict(),
+                    "optimizer_state": opt.state_dict(),
+                    "scheduler_state": sched.state_dict(),
+                    "best_val": float("inf"),
+                }, ckpt_path)
 
     def run(self, target):
         """Process a full-size target image via tiled MiniUNet inference.
