@@ -127,26 +127,28 @@ def convert_onnx(model, output_dir):
     )
     print(f"Channels-last ONNX written to {cl_onnx_path}")
 
-    # qonnx sometimes leaves graph outputs with empty names, which crashes
-    # hls4ml's sanitize_layer_name. Patch any empty output names to match
-    # the actual output tensor name from the last graph node.
+    # qonnx sometimes leaves nodes or graph outputs with empty names, which
+    # crashes hls4ml's sanitize_layer_name (it does new_name[0].isdigit()
+    # without guarding against empty strings). Patch every empty name.
     import onnx as _onnx
     _proto = _onnx.load(cl_onnx_path)
     _changed = False
-    for i, _out in enumerate(_proto.graph.output):
+    for _i, _node in enumerate(_proto.graph.node):
+        if not _node.name:
+            _node.name = f"{_node.op_type}_{_i}"
+            _changed = True
+    for _i, _out in enumerate(_proto.graph.output):
         if not _out.name:
             _real_name = _proto.graph.node[-1].output[0]
-            _proto.graph.output[i].CopyFrom(
-                _onnx.helper.make_tensor_value_info(
-                    _real_name,
-                    _out.type.tensor_type.elem_type,
-                    None,
-                )
+            _new_out = _onnx.helper.make_tensor_value_info(
+                _real_name, _out.type.tensor_type.elem_type, None
             )
+            _proto.graph.output.remove(_out)
+            _proto.graph.output.insert(_i, _new_out)
             _changed = True
     if _changed:
         _onnx.save(_proto, cl_onnx_path)
-        print("Patched empty output name in channels-last ONNX")
+        print("Patched empty node/output names in channels-last ONNX")
 
     config = {
         "Model": {
