@@ -11,6 +11,7 @@ Usage:
 """
 
 import os
+import subprocess
 import sys
 sys.path.append(".")
 import argparse
@@ -110,6 +111,13 @@ def convert_onnx(model, output_dir):
     )
     print(f"ONNX model exported to {onnx_path}")
 
+    cl_onnx_path = onnx_path.replace(".onnx", "_cl.onnx")
+    subprocess.run(
+        ["qonnx-to-channels-last", onnx_path, cl_onnx_path],
+        capture_output=True, text=True, check=True,
+    )
+    print(f"Channels-last ONNX written to {cl_onnx_path}")
+
     config = {
         "Model": {
             "Precision": DEFAULT_PRECISION,
@@ -120,7 +128,7 @@ def convert_onnx(model, output_dir):
     }
 
     hls_model = hls4ml.converters.convert_from_onnx_model(
-        onnx_path,
+        cl_onnx_path,
         hls_config=config,
         output_dir=output_dir,
         backend="Vitis",
