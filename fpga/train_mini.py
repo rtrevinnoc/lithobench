@@ -1,13 +1,18 @@
 """Knowledge distillation training for MiniUNet.
 
 Phase 1: Distill from pretrained full-size NeuralILT UNet on random 64x64 crops.
-Phase 2: (Optional) Quantization-aware training with Brevitas.
+Phase 2: Physics-informed training with lithography simulator.
 
 Usage:
     python3 fpga/train_mini.py --benchmark MetalSet --epochs 16 --batch_size 32
     python3 fpga/train_mini.py --benchmark MetalSet --teacher saved/MetalSet_NeuralILT/net.pth
+
+Resuming after interruption (use inside tmux for long runs):
+    python3 fpga/train_mini.py --benchmark MetalSet --epochs 16 \\
+        --resume saved/fpga/checkpoint_latest.pth
 """
 
+import glob
 import os
 import sys
 sys.path.append(".")
@@ -213,6 +218,26 @@ def physics_epoch(student, tiler, sim, loader, optimizer, device):
     return total_l2 / max(count, 1), total_cpx / max(count, 1)
 
 
+def save_checkpoint(path, epoch, phase, model, optimizer, best_val, scheduler=None):
+    """Save full training state so training can be resumed."""
+    torch.save({
+        "epoch": epoch,
+        "phase": phase,  # "distill" | "physics"
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
+        "best_val": best_val,
+    }, path)
+
+
+def _cleanup_old_checkpoints(output_dir, prefix, keep=3):
+    """Delete old per-epoch checkpoints, keeping only the `keep` most recent."""
+    pattern = os.path.join(output_dir, f"{prefix}_ep*.pth")
+    files = sorted(glob.glob(pattern))
+    for f in files[:-keep]:
+        os.remove(f)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train MiniUNet via knowledge distillation")
     parser.add_argument("--benchmark", "-s", default="MetalSet", type=str)
@@ -229,6 +254,8 @@ def main():
                         help="Epochs of physics-informed training after distillation (0 to skip)")
     parser.add_argument("--output", "-o", default="saved/fpga", type=str)
     parser.add_argument("--njobs", "-j", default=8, type=int)
+    parser.add_argument("--resume", default="", type=str,
+                        help="Path to checkpoint_latest.pth to resume from")
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
@@ -273,29 +300,57 @@ def main():
         print(f"Loading teacher from {args.teacher}")
         teacher = load_teacher(args.teacher, device)
 
+    # Resume from checkpoint if requested
+    start_phase = "distill"
+    distill_start_epoch = 0
     best_val = float("inf")
-    for epoch in range(args.epochs):
-        if teacher is not None:
-            # Decay alpha: start high (rely on teacher), decrease over training
-            alpha = args.alpha * (1.0 - epoch / args.epochs)
-            train_loss = distill_epoch(
-                student, teacher, train_loader, optimizer, device, alpha=alpha
-            )
-            print(f"[Epoch {epoch}] Distill loss={train_loss:.6f} alpha={alpha:.3f}")
-        else:
-            train_loss = pretrain_epoch(student, train_loader, optimizer, device)
-            print(f"[Epoch {epoch}] Pretrain loss={train_loss:.6f}")
+    resume_ckpt = None
+    if args.resume and os.path.exists(args.resume):
+        print(f"Resuming from {args.resume}")
+        resume_ckpt = torch.load(args.resume, map_location="cpu")
+        student.load_state_dict(resume_ckpt["model_state"])
+        start_phase = resume_ckpt["phase"]
+        best_val = resume_ckpt["best_val"]
+        if start_phase == "distill":
+            distill_start_epoch = resume_ckpt["epoch"] + 1
+            optimizer.load_state_dict(resume_ckpt["optimizer_state"])
+            if resume_ckpt["scheduler_state"] is not None:
+                scheduler.load_state_dict(resume_ckpt["scheduler_state"])
+        print(f"  Resumed at phase={start_phase}, next epoch={distill_start_epoch}")
 
-        val_loss = validate(student, val_loader, device)
-        print(f"[Epoch {epoch}] Val loss={val_loss:.6f}")
+    # ------------------------------------------------------------------ #
+    # Phase 1: Distillation / supervised pretraining
+    # ------------------------------------------------------------------ #
+    if start_phase == "distill":
+        for epoch in range(distill_start_epoch, args.epochs):
+            if teacher is not None:
+                # Decay alpha: start high (rely on teacher), decrease over training
+                alpha = args.alpha * (1.0 - epoch / args.epochs)
+                train_loss = distill_epoch(
+                    student, teacher, train_loader, optimizer, device, alpha=alpha
+                )
+                print(f"[Epoch {epoch}] Distill loss={train_loss:.6f} alpha={alpha:.3f}")
+            else:
+                train_loss = pretrain_epoch(student, train_loader, optimizer, device)
+                print(f"[Epoch {epoch}] Pretrain loss={train_loss:.6f}")
 
-        scheduler.step()
+            val_loss = validate(student, val_loader, device)
+            print(f"[Epoch {epoch}] Val loss={val_loss:.6f}")
 
-        if val_loss < best_val:
-            best_val = val_loss
-            save_path = os.path.join(args.output, "mini_unet_best.pth")
-            torch.save(student.state_dict(), save_path)
-            print(f"  Saved best model to {save_path}")
+            scheduler.step()
+
+            if val_loss < best_val:
+                best_val = val_loss
+                save_path = os.path.join(args.output, "mini_unet_best.pth")
+                torch.save(student.state_dict(), save_path)
+                print(f"  Saved best model to {save_path}")
+
+            # Per-epoch checkpoint + rolling latest
+            ckpt_path = os.path.join(args.output, f"ckpt_distill_ep{epoch}.pth")
+            save_checkpoint(ckpt_path, epoch, "distill", student, optimizer, best_val, scheduler)
+            save_checkpoint(os.path.join(args.output, "checkpoint_latest.pth"),
+                            epoch, "distill", student, optimizer, best_val, scheduler)
+            _cleanup_old_checkpoints(args.output, "ckpt_distill", keep=3)
 
     # ------------------------------------------------------------------ #
     # Phase 2: Physics-informed training with lithography simulator
@@ -306,26 +361,42 @@ def main():
         sim = litho.LithoSim("./config/lithosimple.txt")
         tiler = TiledInference(tile_size=args.tile_size, overlap=16, image_size=512)
 
-        # Full-size image loaders (batch_size=1 since tiled pipeline is per-image)
         physics_optimizer = optim.Adam(student.parameters(), lr=args.lr * 0.1)
         physics_scheduler = lr_sched.StepLR(physics_optimizer, 1, gamma=0.1)
 
-        for epoch in range(args.physics_epochs):
+        physics_start_epoch = 0
+        if start_phase == "physics" and resume_ckpt is not None:
+            physics_start_epoch = resume_ckpt["epoch"] + 1
+            physics_optimizer.load_state_dict(resume_ckpt["optimizer_state"])
+            if resume_ckpt["scheduler_state"] is not None:
+                physics_scheduler.load_state_dict(resume_ckpt["scheduler_state"])
+            print(f"  Resuming physics at epoch {physics_start_epoch}")
+
+        for epoch in range(physics_start_epoch, args.physics_epochs):
             l2_avg, cpx_avg = physics_epoch(
                 student, tiler, sim, train_loader_full,
                 physics_optimizer, device,
             )
             print(f"[Physics Epoch {epoch}] L2={l2_avg:.6f} cpx={cpx_avg:.6f}")
 
-            # Save after each physics epoch
+            # Weights-only best checkpoint (for deployment)
             save_path = os.path.join(args.output, "mini_unet_best.pth")
             torch.save(student.state_dict(), save_path)
             print(f"  Saved to {save_path}")
 
+            # Per-epoch checkpoint + rolling latest
+            ckpt_path = os.path.join(args.output, f"ckpt_physics_ep{epoch}.pth")
+            save_checkpoint(ckpt_path, epoch, "physics",
+                            student, physics_optimizer, best_val, physics_scheduler)
+            save_checkpoint(os.path.join(args.output, "checkpoint_latest.pth"),
+                            epoch, "physics",
+                            student, physics_optimizer, best_val, physics_scheduler)
+            _cleanup_old_checkpoints(args.output, "ckpt_physics", keep=3)
+
             if epoch == args.physics_epochs // 2:
                 physics_scheduler.step()
 
-    # Save final checkpoint
+    # Save final weights-only checkpoint
     final_path = os.path.join(args.output, "mini_unet_final.pth")
     torch.save(student.state_dict(), final_path)
     print(f"Final model saved to {final_path}")
