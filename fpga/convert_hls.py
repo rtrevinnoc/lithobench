@@ -121,12 +121,10 @@ def convert_onnx(model, output_dir):
 
     # hls4ml's ONNX parser requires channels-last layout
     cl_onnx_path = onnx_path.replace(".onnx", "_cl.onnx")
-    try:
-        from qonnx.util.to_channels_last import exec_toChannelsLast
-        exec_toChannelsLast(onnx_path, cl_onnx_path)
-    except ImportError:
-        import subprocess
-        subprocess.run(["qonnx-to-channels-last", onnx_path, cl_onnx_path], check=True)
+    from qonnx.core.modelwrapper import ModelWrapper
+    from qonnx.util.to_channels_last import to_channels_last
+    cl_model = to_channels_last(ModelWrapper(onnx_path))
+    cl_model.save(cl_onnx_path)
     print(f"Channels-last ONNX written to {cl_onnx_path}")
 
     hls_model = hls4ml.converters.convert_from_onnx_model(

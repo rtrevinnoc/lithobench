@@ -12,8 +12,10 @@ class MiniUNet(nn.Module):
     Original: 1 -> 64 -> 128 -> 256 -> 512  (~7.8M params)
     This:     1 ->  8 ->  16 ->  32 ->  64  (~122K params)
 
-    Changes from original for hls4ml compatibility:
-    - Bilinear upsampling replaced with ConvTranspose2d(kernel=2, stride=2)
+    Changes from original:
+    - ConvTranspose2d(kernel=2, stride=2) for upsampling (learnable, ONNX-exportable;
+      note: hls4ml's PyTorch frontend does not support ConvTranspose2d — use
+      fpga/convert_hls.py which goes through the ONNX path via qonnx)
     - Explicit nn.Sequential blocks (no helper functions) for torch.fx tracing
     - 1x1 final conv instead of 3x3
 
