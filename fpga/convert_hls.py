@@ -105,7 +105,7 @@ def convert_onnx(model, output_dir):
         onnx_path,
         input_names=["input"],
         output_names=["output"],
-        opset_version=13,
+        opset_version=11,
         dynamic_axes=None,
     )
     print(f"ONNX model exported to {onnx_path}")
@@ -119,11 +119,13 @@ def convert_onnx(model, output_dir):
         }
     }
 
-    # hls4ml's ONNX parser requires channels-last layout
-    cl_onnx_path = onnx_path.replace(".onnx", "_cl.onnx")
+    # hls4ml's ONNX parser requires channels-last layout.
+    # Pass the loaded proto (not a path string) to avoid ModelWrapper double-wrapping.
+    import onnx as _onnx
     from qonnx.core.modelwrapper import ModelWrapper
     from qonnx.util.to_channels_last import to_channels_last
-    cl_model = to_channels_last(ModelWrapper(onnx_path))
+    cl_onnx_path = onnx_path.replace(".onnx", "_cl.onnx")
+    cl_model = to_channels_last(ModelWrapper(_onnx.load(onnx_path)))
     cl_model.save(cl_onnx_path)
     print(f"Channels-last ONNX written to {cl_onnx_path}")
 
