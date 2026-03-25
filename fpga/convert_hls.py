@@ -113,7 +113,7 @@ def convert_onnx(model, output_dir):
 
     cl_onnx_path = onnx_path.replace(".onnx", "_cl.onnx")
     subprocess.run(
-        ["qonnx-to-channels-last", onnx_path, cl_onnx_path],
+        ["qonnx-to-channels-last", f"--out-file={cl_onnx_path}", onnx_path],
         capture_output=True, text=True, check=True,
     )
     print(f"Channels-last ONNX written to {cl_onnx_path}")
