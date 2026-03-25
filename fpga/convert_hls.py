@@ -53,7 +53,7 @@ def convert_pytorch(model, output_dir):
 
     config = hls4ml.utils.config_from_pytorch_model(
         model,
-        input_shape=list(INPUT_SHAPE),
+        input_shape=INPUT_SHAPE,
         granularity="name",
         backend="Vitis",
         default_precision=DEFAULT_PRECISION,
@@ -80,7 +80,7 @@ def convert_pytorch(model, output_dir):
 
     hls_model = hls4ml.converters.convert_from_pytorch_model(
         model,
-        input_shape=list(INPUT_SHAPE),
+        input_shape=INPUT_SHAPE,
         hls_config=config,
         output_dir=output_dir,
         backend="Vitis",
@@ -119,8 +119,18 @@ def convert_onnx(model, output_dir):
         }
     }
 
+    # hls4ml's ONNX parser requires channels-last layout
+    cl_onnx_path = onnx_path.replace(".onnx", "_cl.onnx")
+    try:
+        from qonnx.util.to_channels_last import exec_toChannelsLast
+        exec_toChannelsLast(onnx_path, cl_onnx_path)
+    except ImportError:
+        import subprocess
+        subprocess.run(["qonnx-to-channels-last", onnx_path, cl_onnx_path], check=True)
+    print(f"Channels-last ONNX written to {cl_onnx_path}")
+
     hls_model = hls4ml.converters.convert_from_onnx_model(
-        onnx_path,
+        cl_onnx_path,
         hls_config=config,
         output_dir=output_dir,
         backend="Vitis",
