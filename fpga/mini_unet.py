@@ -13,9 +13,8 @@ class MiniUNet(nn.Module):
     This:     1 ->  8 ->  16 ->  32 ->  64  (~122K params)
 
     Changes from original:
-    - ConvTranspose2d(kernel=2, stride=2) for upsampling (learnable, ONNX-exportable;
-      note: hls4ml's PyTorch frontend does not support ConvTranspose2d — use
-      fpga/convert_hls.py which goes through the ONNX path via qonnx)
+    - nn.Upsample(scale_factor=2, mode='nearest') for upsampling (parameter-free,
+      exports to ONNX Resize op which hls4ml's ONNX frontend supports)
     - Explicit nn.Sequential blocks (no helper functions) for torch.fx tracing
     - 1x1 final conv instead of 3x3
 
@@ -66,8 +65,8 @@ class MiniUNet(nn.Module):
             nn.ReLU(),
         )
 
-        # Decoder — ConvTranspose2d for hls4ml-compatible upsampling
-        self.up3 = nn.ConvTranspose2d(64, 64, kernel_size=2, stride=2)
+        # Decoder — nearest-neighbour upsample (exports as ONNX Resize, supported by hls4ml)
+        self.up3 = nn.Upsample(scale_factor=2, mode='nearest')
         self.deconv3 = nn.Sequential(
             nn.Conv2d(64 + 32, 32, kernel_size=3, stride=1, padding=1, bias=True),
             nn.BatchNorm2d(32),
@@ -77,7 +76,7 @@ class MiniUNet(nn.Module):
             nn.ReLU(),
         )
 
-        self.up2 = nn.ConvTranspose2d(32, 32, kernel_size=2, stride=2)
+        self.up2 = nn.Upsample(scale_factor=2, mode='nearest')
         self.deconv2 = nn.Sequential(
             nn.Conv2d(32 + 16, 16, kernel_size=3, stride=1, padding=1, bias=True),
             nn.BatchNorm2d(16),
@@ -87,7 +86,7 @@ class MiniUNet(nn.Module):
             nn.ReLU(),
         )
 
-        self.up1 = nn.ConvTranspose2d(16, 16, kernel_size=2, stride=2)
+        self.up1 = nn.Upsample(scale_factor=2, mode='nearest')
         self.deconv1 = nn.Sequential(
             nn.Conv2d(16 + 8, 8, kernel_size=3, stride=1, padding=1, bias=True),
             nn.BatchNorm2d(8),
