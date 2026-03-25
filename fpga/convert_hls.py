@@ -108,12 +108,21 @@ def convert_onnx(model, output_dir):
         output_names=["output"],
         opset_version=9,
         dynamic_axes=None,
+        dynamo=False,
     )
     print(f"ONNX model exported to {onnx_path}")
 
+    clean_onnx_path = onnx_path.replace(".onnx", "_clean.onnx")
+    subprocess.run(
+        ["qonnx-cleanup", onnx_path, "--out-file", clean_onnx_path],
+        capture_output=True, text=True, check=True,
+    )
+    print(f"Cleaned ONNX written to {clean_onnx_path}")
+
     cl_onnx_path = onnx_path.replace(".onnx", "_cl.onnx")
     subprocess.run(
-        ["qonnx-to-channels-last", f"--out-file={cl_onnx_path}", onnx_path],
+        ["qonnx-to-channels-last", "--make-input-channels-last",
+         f"--out-file={cl_onnx_path}", clean_onnx_path],
         capture_output=True, text=True, check=True,
     )
     print(f"Channels-last ONNX written to {cl_onnx_path}")
