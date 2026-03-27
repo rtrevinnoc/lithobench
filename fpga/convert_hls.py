@@ -209,17 +209,26 @@ def convert_onnx(model, output_dir):
     except Exception as _ip_err:
         print(f"Warning: Could not patch infer_precision: {_ip_err}")
 
-    config = {
-        "Model": {
-            "Precision": DEFAULT_PRECISION,
-            "ReuseFactor": DEFAULT_REUSE_FACTOR,
-            "IOType": IO_TYPE,
-            "Strategy": STRATEGY,
-        }
-    }
-
-    hls_model = hls4ml.converters.convert_from_onnx_model(
+    # 1. Generate the full configuration dictionary automatically
+    # (hls4ml can accept the file path string directly, saving you a reload!)
+    config = hls4ml.utils.config_from_onnx_model(
         cl_onnx_path,
+        default_precision=DEFAULT_PRECISION,
+        default_reuse_factor=DEFAULT_REUSE_FACTOR
+    )
+
+    # 2. Apply your global settings
+    config["Model"]["IOType"] = IO_TYPE
+    config["Model"]["Strategy"] = STRATEGY
+
+    # 3. Apply your bottleneck reuse factors
+    for layer_name in config.get("LayerName", {}):
+        if "conv4" in layer_name.lower():
+            config["LayerName"][layer_name]["ReuseFactor"] = BOTTLENECK_REUSE_FACTOR
+
+    # 4. Convert using the auto-generated config
+    hls_model = hls4ml.converters.convert_from_onnx_model(
+        cl_onnx_path, # Passing the path directly works perfectly here too
         hls_config=config,
         output_dir=output_dir,
         backend="Vitis",
