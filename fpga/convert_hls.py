@@ -158,10 +158,7 @@ def convert_onnx(model, output_dir):
             for _j, _init in enumerate(_proto.graph.initializer):
                 if _init.name == _node.input[1]:
                     if _onnx.numpy_helper.to_array(_init).size == 0:
-                        _dummy = _np.zeros(8, dtype=_np.float32)
-                        _proto.graph.initializer[_j].CopyFrom(
-                            _onnx.numpy_helper.from_array(_dummy, name=_init.name)
-                        )
+                        _node.input[1] = ""  # signal "ROI not provided" — hls4ml skips it
                         _changed = True
 
     if _changed:
