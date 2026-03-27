@@ -96,122 +96,44 @@ def convert_pytorch(model, output_dir):
 def convert_onnx(model, output_dir):
     """Fallback: export to ONNX, then convert via hls4ml ONNX frontend."""
     import hls4ml
+    import onnx as _onnx
+    import numpy as _np
 
     onnx_path = os.path.join(output_dir, "mini_unet.onnx")
     os.makedirs(output_dir, exist_ok=True)
 
+    # 1. Export
     dummy_input = torch.randn(*INPUT_SHAPE)
     torch.onnx.export(
-        model,
-        dummy_input,
-        onnx_path,
-        input_names=["input"],
-        output_names=["output"],
-        opset_version=11,
-        dynamic_axes=None,
-        dynamo=False,
+        model, dummy_input, onnx_path,
+        input_names=["input"], output_names=["output"],
+        opset_version=11
     )
-    print(f"ONNX model exported to {onnx_path}")
 
+    # 2. Clean and Convert to Channels-Last
     clean_onnx_path = onnx_path.replace(".onnx", "_clean.onnx")
-    subprocess.run(
-        ["qonnx-cleanup", onnx_path, "--out-file", clean_onnx_path],
-        capture_output=True, text=True, check=True,
-    )
-    print(f"Cleaned ONNX written to {clean_onnx_path}")
-
     cl_onnx_path = onnx_path.replace(".onnx", "_cl.onnx")
-    subprocess.run(
-        ["qonnx-to-channels-last", "--make-input-channels-last",
-         f"--out-file={cl_onnx_path}", clean_onnx_path],
-        capture_output=True, text=True, check=True,
-    )
-    print(f"Channels-last ONNX written to {cl_onnx_path}")
+    
+    subprocess.run(["qonnx-cleanup", onnx_path, "--out-file", clean_onnx_path], check=True)
+    subprocess.run(["qonnx-to-channels-last", "--make-input-channels-last", 
+                    f"--out-file={cl_onnx_path}", clean_onnx_path], check=True)
 
-    # qonnx sometimes leaves nodes or graph outputs with empty names, which
-    # crashes hls4ml's sanitize_layer_name (it does new_name[0].isdigit()
-    # without guarding against empty strings). Patch every empty name.
-    import onnx as _onnx
-    _proto = _onnx.load(cl_onnx_path)
-    _changed = False
-    for _i, _node in enumerate(_proto.graph.node):
-        if not _node.name:
-            _node.name = f"{_node.op_type}_{_i}"
-            _changed = True
-    for _i, _out in enumerate(_proto.graph.output):
-        if not _out.name:
-            _real_name = _proto.graph.node[-1].output[0]
-            _new_out = _onnx.helper.make_tensor_value_info(
-                _real_name, _out.type.tensor_type.elem_type, None
-            )
-            _proto.graph.output.remove(_out)
-            _proto.graph.output.insert(_i, _new_out)
-            _changed = True
-    # PyTorch (opset 11) exports an empty ROI tensor for nearest-neighbour Resize.
-    # Replace empty ROI initializers with 8 zeros so hls4ml's get_input_shape can
-    # find the tensor by name (it needs a named initializer with a valid shape).
-    import numpy as _np
-    for _node in _proto.graph.node:
-        if _node.op_type == 'Resize' and len(_node.input) > 1 and _node.input[1]:
-            for _j, _init in enumerate(_proto.graph.initializer):
-                if _init.name == _node.input[1]:
-                    if _onnx.numpy_helper.to_array(_init).size == 0:
-                        _dummy = _np.zeros(8, dtype=_np.float32)
-                        _proto.graph.initializer[_j].CopyFrom(
-                            _onnx.numpy_helper.from_array(_dummy, name=_init.name)
-                        )
-                        _changed = True
-
-    if _changed:
-        _onnx.save(_proto, cl_onnx_path)
-        print("Patched empty node/output names in channels-last ONNX")
-
-    # hls4ml's resize_remove_constants contains bare `if node.get_attr('value'):`
-    # checks for the roi, scales, and sizes constant nodes. In NumPy >= 1.25 this
-    # raises ValueError for any array (empty or multi-element). Patch the method
-    # with a regex replacement that covers all three occurrences at once.
-    try:
-        import inspect, re as _re, textwrap as _tw, numpy as _np_fix
-        import hls4ml.model.optimizer.passes.resize_remove_constants as _rrc
-        _src = _tw.dedent(inspect.getsource(_rrc.ResizeRemoveConstants.transform))
-        _fixed = _re.sub(
-            r"if (\w+)\.get_attr\('value'\):",
-            r"if \1 is not None and \1.get_attr('value') is not None:",
-            _src,
-        )
-        if _fixed != _src:
-            _exec_ns = {**vars(_rrc), '_np_fix': _np_fix}
-            exec(compile(_fixed, '<fix_resize>', 'exec'), _exec_ns)
-            _rrc.ResizeRemoveConstants.transform = _exec_ns['transform']
-            print("Applied numpy compatibility patch to hls4ml ResizeRemoveConstants")
-    except Exception as _patch_err:
-        print(f"Warning: Could not patch ResizeRemoveConstants: {_patch_err}")
-
-    # infer_precision.match calls node.get_input_variable() -> self.inputs[0], which
-    # crashes for Constant nodes (inputs=[]) that linger in the optimizer's node
-    # snapshot after resize_remove_constants removed them from the live graph.
-    # Patch every 'match' method in the module to return False for no-input nodes.
-    try:
-        import hls4ml.model.optimizer.passes.infer_precision as _ip_mod
-        for _cls_name in dir(_ip_mod):
-            _cls = getattr(_ip_mod, _cls_name)
-            if isinstance(_cls, type) and callable(getattr(_cls, 'match', None)):
-                _orig_match = _cls.match
-                def _safe_match(self, node, _orig=_orig_match):
-                    if not getattr(node, 'inputs', None):
-                        return False
-                    try:
-                        return _orig(self, node)
-                    except IndexError:
-                        return False
-                _cls.match = _safe_match
-        print("Applied infer_precision safety patch")
-    except Exception as _ip_err:
-        print(f"Warning: Could not patch infer_precision: {_ip_err}")
-
+    # 3. Load and Patch
     model_proto = _onnx.load(cl_onnx_path)
+    
+    # Fix the ROI/Resize issue and empty names
+    for i, node in enumerate(model_proto.graph.node):
+        if not node.name:
+            node.name = f"{node.op_type}_{i}"
+        if node.op_type == 'Resize' and len(node.input) > 1:
+            # hls4ml needs the ROI to be a valid shape even if unused
+            for init in model_proto.graph.initializer:
+                if init.name == node.input[1] and _np.prod(init.dims) == 0:
+                    dummy_roi = _onnx.numpy_helper.from_array(_np.zeros(8, dtype=_np.float32), name=init.name)
+                    init.CopyFrom(dummy_roi)
 
-    # 2. Generate the full configuration dictionary automatically
+    # 4. Generate Config with Catch-All Precision
+    # This is the part that fixes 'UnspecifiedPrecisionType'
     config = hls4ml.utils.config_from_onnx_model(
         model_proto,
         default_precision=DEFAULT_PRECISION,
@@ -219,34 +141,25 @@ def convert_onnx(model, output_dir):
         backend="Vitis"
     )
 
-    # 3. Apply global settings
     config["Model"]["IOType"] = IO_TYPE
     config["Model"]["Strategy"] = STRATEGY
 
-    # 4. CRITICAL FIX: Manually tune ReuseFactors to avoid the Split Error
+    # THE CRITICAL FIX: Force precision for all layer types to prevent "Unspecified" errors
+    if "LayerType" not in config:
+        config["LayerType"] = {}
+    config["LayerType"]["Precision"] = DEFAULT_PRECISION
+
+    # Apply specific overrides
     for layer_name in config.get("LayerName", {}):
-        # The first layer (Conv_0) usually has only 1 input channel.
-        # A ReuseFactor of 16 is impossible for 1 channel. Force it to 1.
-        if "conv_0" in layer_name.lower():
-            config["LayerName"][layer_name]["ReuseFactor"] = 1
-        
-        # The final layer (often Conv_14 in your case) also tends to have 
-        # few channels (output mask). Force it to a small power of 2.
-        elif "conv_14" in layer_name.lower():
-            config["LayerName"][layer_name]["ReuseFactor"] = 1 
-
-        # For bottleneck layers, use a factor that actually divides your 
-        # channel count (e.g., if channels=32, use 8, 16, or 32)
-        elif "conv4" in layer_name.lower():
+        if "conv4" in layer_name.lower():
             config["LayerName"][layer_name]["ReuseFactor"] = BOTTLENECK_REUSE_FACTOR
-        
-        # For everything else, if 16 is failing, try 8 or 4.
-        else:
-            config["LayerName"][layer_name]["ReuseFactor"] = 8
+        if "sigmoid" in layer_name.lower():
+            config["LayerName"][layer_name]["table_size"] = 512
+            config["LayerName"][layer_name]["table_t"] = "ap_fixed<10,6>"
 
-    # 5. Convert - this function usually accepts either the path or the object
+    # 5. Final Conversion
     hls_model = hls4ml.converters.convert_from_onnx_model(
-        cl_onnx_path,
+        model_proto,
         hls_config=config,
         output_dir=output_dir,
         backend="Vitis",
