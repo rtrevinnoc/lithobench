@@ -176,7 +176,7 @@ def convert_onnx(model, output_dir):
         _src = _tw.dedent(inspect.getsource(_rrc.ResizeRemoveConstants.transform))
         _fixed = _re.sub(
             r"if (\w+)\.get_attr\('value'\):",
-            r"if \1 is not None and len(_np_fix.asarray(\1.get_attr('value')).ravel()) > 0:",
+            r"if \1 is not None and \1.get_attr('value') is not None:",
             _src,
         )
         if _fixed != _src:
