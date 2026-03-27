@@ -177,7 +177,7 @@ def convert_onnx(model, output_dir):
         _src = _tw.dedent(inspect.getsource(_rrc.ResizeRemoveConstants.transform))
         _fixed = _src.replace(
             "if roi_node.get_attr('value'):",
-            "if roi_node is not None and _np_fix.any(_np_fix.asarray(roi_node.get_attr('value')).ravel()):",
+            "if roi_node is not None and len(_np_fix.asarray(roi_node.get_attr('value')).ravel()) > 0:",
         )
         if _fixed != _src:
             _exec_ns = {**vars(_rrc), '_np_fix': _np_fix}
