@@ -166,20 +166,21 @@ def validate_csim(model, hls_model, num_samples=10):
     max_diffs = []
 
     for i in range(num_samples):
-        # 1. Create the input in PyTorch format (N, C, H, W)
-        # Assuming INPUT_SHAPE is (1, 1, 64, 64)
-        test_input_pt = np.random.rand(*INPUT_SHAPE).astype(np.float32)
+        # 1. Create the input (Batch, Channel, Height, Width)
+        test_input_pt = np.random.rand(1, 1, 64, 64).astype(np.float32)
 
-        # 2. PyTorch reference
-        model.eval()
-        with torch.no_grad():
-            pt_out = model(torch.tensor(test_input_pt)).numpy()
+        # 2. Prepare for HLS
+        # Instead of np.squeeze(test_input_pt), remove ONLY the first dimension:
+        test_input_hls = test_input_pt[0]  # Result: (1, 64, 64)
 
-        # 3. PREPARE FOR HLS: 
-        # hls4ml C-sim usually expects (H, W, C) and NO batch dim 
-        # for the internal .predict() call if using io_stream/parallel
-        test_input_hls = np.squeeze(test_input_pt) # Remove batch: (1, 64, 64)
-        test_input_hls = np.transpose(test_input_hls, (1, 2, 0)) # To (64, 64, 1)
+        # 3. Now transpose to (64, 64, 1)
+        test_input_hls = np.transpose(test_input_hls, (1, 2, 0)) 
+
+        # 4. Final safety check (optional but helpful for debugging)
+        if test_input_hls.shape != (64, 64, 1):
+            print(f"DEBUG: Shape is {test_input_hls.shape}, expected (64, 64, 1)")
+
+        test_input_hls = np.ascontiguousarray(test_input_hls)
         
         # Ensure it is contiguous in memory (C++ hates non-contiguous arrays)
         test_input_hls = np.ascontiguousarray(test_input_hls)
