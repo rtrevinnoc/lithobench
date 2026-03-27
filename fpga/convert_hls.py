@@ -187,6 +187,28 @@ def convert_onnx(model, output_dir):
     except Exception as _patch_err:
         print(f"Warning: Could not patch ResizeRemoveConstants: {_patch_err}")
 
+    # infer_precision.match calls node.get_input_variable() -> self.inputs[0], which
+    # crashes for Constant nodes (inputs=[]) that linger in the optimizer's node
+    # snapshot after resize_remove_constants removed them from the live graph.
+    # Patch every 'match' method in the module to return False for no-input nodes.
+    try:
+        import hls4ml.model.optimizer.passes.infer_precision as _ip_mod
+        for _cls_name in dir(_ip_mod):
+            _cls = getattr(_ip_mod, _cls_name)
+            if isinstance(_cls, type) and callable(getattr(_cls, 'match', None)):
+                _orig_match = _cls.match
+                def _safe_match(self, node, _orig=_orig_match):
+                    if not getattr(node, 'inputs', None):
+                        return False
+                    try:
+                        return _orig(self, node)
+                    except IndexError:
+                        return False
+                _cls.match = _safe_match
+        print("Applied infer_precision safety patch")
+    except Exception as _ip_err:
+        print(f"Warning: Could not patch infer_precision: {_ip_err}")
+
     config = {
         "Model": {
             "Precision": DEFAULT_PRECISION,
