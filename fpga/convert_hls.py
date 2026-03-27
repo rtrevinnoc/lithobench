@@ -76,8 +76,9 @@ def convert_pytorch(model, output_dir):
             config["LayerName"][layer_name]["table_size"] = 512
             config["LayerName"][layer_name]["table_t"] = "ap_fixed<10,6>"
 
+    import json
     print("hls4ml configuration:")
-    print(hls4ml.utils.config.print_config(config))
+    print(json.dumps(config, indent=2))
 
     hls_model = hls4ml.converters.convert_from_pytorch_model(
         model,
@@ -106,7 +107,7 @@ def convert_onnx(model, output_dir):
         onnx_path,
         input_names=["input"],
         output_names=["output"],
-        opset_version=9,
+        opset_version=11,
         dynamic_axes=None,
         dynamo=False,
     )
