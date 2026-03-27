@@ -94,46 +94,35 @@ def convert_pytorch(model, output_dir):
 
 
 def convert_onnx(model, output_dir):
-    """Fallback: export to ONNX, then convert via hls4ml ONNX frontend."""
     import hls4ml
     import onnx as _onnx
-    import numpy as _np
 
     onnx_path = os.path.join(output_dir, "mini_unet.onnx")
     os.makedirs(output_dir, exist_ok=True)
 
-    # 1. Export
+    # 1. CLEAN EXPORT
     dummy_input = torch.randn(*INPUT_SHAPE)
     torch.onnx.export(
         model, dummy_input, onnx_path,
         input_names=["input"], output_names=["output"],
-        opset_version=11
+        opset_version=11,
+        do_constant_folding=True,
+        operator_export_type=torch.onnx.OperatorExportTypes.ONNX
     )
 
-    # 2. Clean and Convert to Channels-Last
-    clean_onnx_path = onnx_path.replace(".onnx", "_clean.onnx")
+    # 2. OPTIONAL CLEANUP (Try-Except)
+    # If qonnx fails, we proceed with the raw ONNX which hls4ml can often handle anyway
     cl_onnx_path = onnx_path.replace(".onnx", "_cl.onnx")
-    
-    subprocess.run(["qonnx-cleanup", onnx_path, "--out-file", clean_onnx_path], check=True)
-    subprocess.run(["qonnx-to-channels-last", "--make-input-channels-last", 
-                    f"--out-file={cl_onnx_path}", clean_onnx_path], check=True)
+    try:
+        subprocess.run(["qonnx-cleanup", onnx_path, "--out-file", onnx_path], check=True)
+        subprocess.run(["qonnx-to-channels-last", "--make-input-channels-last", 
+                        f"--out-file={cl_onnx_path}", onnx_path], check=True)
+    except Exception as e:
+        print(f"QONNX Cleanup failed: {e}. Attempting direct conversion...")
+        cl_onnx_path = onnx_path 
 
-    # 3. Load and Patch
+    # 3. ROBUST CONFIG
     model_proto = _onnx.load(cl_onnx_path)
-    
-    # Fix the ROI/Resize issue and empty names
-    for i, node in enumerate(model_proto.graph.node):
-        if not node.name:
-            node.name = f"{node.op_type}_{i}"
-        if node.op_type == 'Resize' and len(node.input) > 1:
-            # hls4ml needs the ROI to be a valid shape even if unused
-            for init in model_proto.graph.initializer:
-                if init.name == node.input[1] and _np.prod(init.dims) == 0:
-                    dummy_roi = _onnx.numpy_helper.from_array(_np.zeros(8, dtype=_np.float32), name=init.name)
-                    init.CopyFrom(dummy_roi)
-
-    # 4. Generate Config with Catch-All Precision
-    # This is the part that fixes 'UnspecifiedPrecisionType'
     config = hls4ml.utils.config_from_onnx_model(
         model_proto,
         default_precision=DEFAULT_PRECISION,
@@ -143,21 +132,12 @@ def convert_onnx(model, output_dir):
 
     config["Model"]["IOType"] = IO_TYPE
     config["Model"]["Strategy"] = STRATEGY
-
-    # THE CRITICAL FIX: Force precision for all layer types to prevent "Unspecified" errors
-    if "LayerType" not in config:
-        config["LayerType"] = {}
+    
+    # Fix the UnspecifiedPrecisionType from earlier
+    if "LayerType" not in config: config["LayerType"] = {}
     config["LayerType"]["Precision"] = DEFAULT_PRECISION
 
-    # Apply specific overrides
-    for layer_name in config.get("LayerName", {}):
-        if "conv4" in layer_name.lower():
-            config["LayerName"][layer_name]["ReuseFactor"] = BOTTLENECK_REUSE_FACTOR
-        if "sigmoid" in layer_name.lower():
-            config["LayerName"][layer_name]["table_size"] = 512
-            config["LayerName"][layer_name]["table_t"] = "ap_fixed<10,6>"
-
-    # 5. Final Conversion
+    # 4. CONVERT
     hls_model = hls4ml.converters.convert_from_onnx_model(
         model_proto,
         hls_config=config,
@@ -166,7 +146,6 @@ def convert_onnx(model, output_dir):
         part=FPGA_PART,
         clock_period=CLOCK_PERIOD,
     )
-
     return hls_model
 
 
