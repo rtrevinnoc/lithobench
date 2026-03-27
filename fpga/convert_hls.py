@@ -211,8 +211,7 @@ def convert_onnx(model, output_dir):
 
     model_proto = _onnx.load(cl_onnx_path)
 
-    # 2. Generate the config using the model OBJECT, not the string path
-    # Also added the 'backend' argument to resolve that warning
+    # 2. Generate the full configuration dictionary automatically
     config = hls4ml.utils.config_from_onnx_model(
         model_proto,
         default_precision=DEFAULT_PRECISION,
@@ -220,14 +219,30 @@ def convert_onnx(model, output_dir):
         backend="Vitis"
     )
 
-    # 3. Apply your global settings
+    # 3. Apply global settings
     config["Model"]["IOType"] = IO_TYPE
     config["Model"]["Strategy"] = STRATEGY
 
-    # 4. Apply your bottleneck reuse factors
+    # 4. CRITICAL FIX: Manually tune ReuseFactors to avoid the Split Error
     for layer_name in config.get("LayerName", {}):
-        if "conv4" in layer_name.lower():
+        # The first layer (Conv_0) usually has only 1 input channel.
+        # A ReuseFactor of 16 is impossible for 1 channel. Force it to 1.
+        if "conv_0" in layer_name.lower():
+            config["LayerName"][layer_name]["ReuseFactor"] = 1
+        
+        # The final layer (often Conv_14 in your case) also tends to have 
+        # few channels (output mask). Force it to a small power of 2.
+        elif "conv_14" in layer_name.lower():
+            config["LayerName"][layer_name]["ReuseFactor"] = 1 
+
+        # For bottleneck layers, use a factor that actually divides your 
+        # channel count (e.g., if channels=32, use 8, 16, or 32)
+        elif "conv4" in layer_name.lower():
             config["LayerName"][layer_name]["ReuseFactor"] = BOTTLENECK_REUSE_FACTOR
+        
+        # For everything else, if 16 is failing, try 8 or 4.
+        else:
+            config["LayerName"][layer_name]["ReuseFactor"] = 8
 
     # 5. Convert - this function usually accepts either the path or the object
     hls_model = hls4ml.converters.convert_from_onnx_model(
