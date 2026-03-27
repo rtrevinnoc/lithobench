@@ -53,57 +53,50 @@ def convert_pytorch(model, output_dir):
     import hls4ml
     import torch
 
-    # Ensure model is in eval mode and on CPU
     model.eval()
     model.cpu()
 
-    # 1. Generate config with 'full' channels-last conversion.
-    # This automatically handles the NCHW (Torch) to NHWC (FPGA) logic.
+    # 1. Use 16-bit as the base for the entire model
     config = hls4ml.utils.config_from_pytorch_model(
         model,
-        input_shape=INPUT_SHAPE, # Should be [1, 1, 64, 64]
+        input_shape=INPUT_SHAPE, 
         granularity="name",
         backend="Vitis",
-        default_precision=DEFAULT_PRECISION,
-        # This is the "magic" flag for U-Nets in hls4ml
+        default_precision="ap_fixed<16,6>", # Standard for HLS DL
         channels_last_conversion='full', 
         transpose_outputs=True
     )
 
     # 2. Global settings
-    config["Model"]["IOType"] = "io_stream" # Critical for U-Nets
-    # config["Model"]["Strategy"] = "Latency" # Or 'Resource' if it's too big
-
-    config['Model']['Precision'] = 'ap_fixed<32,16>' # Very wide for debugging
-    config['Model']['Strategy'] = 'Resource'        # Resource strategy is often more stable for C-Sim
+    config["Model"]["IOType"] = "io_stream" 
+    config['Model']['Strategy'] = 'Resource' # Necessary for large U-Nets
 
     # 3. Patch the Layer Config
     if "LayerName" not in config:
         config["LayerName"] = {}
 
     for layer_name in list(config.get("LayerName", {}).keys()):
-        # Increase reuse factor for bottleneck to save DSPs
+        # Bottleneck: Increase ReuseFactor to save DSPs if timing is hard to meet
         if "conv4" in layer_name:
-            config["LayerName"][layer_name]["ReuseFactor"] = 8 # Example value
+            config["LayerName"][layer_name]["ReuseFactor"] = 16 
         
-        # Sigmoid tuning
+        # Sigmoid: Keep the "Hardened" LUT to prevent C-Sim crashes/NaNs
         if 'sigmoid' in layer_name.lower():
-                config['LayerName'][layer_name]['Precision'] = 'ap_fixed<16,6>'
-                config['LayerName'][layer_name]['table_size'] = 2048 # Double the size
-                # table_t defines the input range of the LUT. 
-                # ap_fixed<18,8> allows inputs up to +255, -255
-                config['LayerName'][layer_name]['table_t'] = 'ap_fixed<18,8>'
+            config['LayerName'][layer_name]['Precision'] = 'ap_fixed<16,6>'
+            config['LayerName'][layer_name]['table_size'] = 2048
+            # Wider table_t allows the LUT to handle larger activation swings
+            config['LayerName'][layer_name]['table_t'] = 'ap_fixed<18,8>'
 
-
+    # 4. Critical: Downsize the LayerType defaults
+    # This ensures skip-connections and resizes don't waste 32-bit registers
     config['LayerType'] = {
-        'Conv2D': {'Precision': 'ap_fixed<32,16>'},
-        'Activation': {'Precision': 'ap_fixed<32,16>'},
-        'Concatenate': {'Precision': 'ap_fixed<32,16>'},
-        'Resize': {'Precision': 'ap_fixed<32,16>'},
-        'Merge': {'Precision': 'ap_fixed<32,16>'}
+        'Conv2D': {'Precision': 'ap_fixed<16,6>'},
+        'Activation': {'Precision': 'ap_fixed<16,6>'},
+        'Concatenate': {'Precision': 'ap_fixed<16,6>'},
+        'Resize': {'Precision': 'ap_fixed<16,6>'},
+        'Merge': {'Precision': 'ap_fixed<16,6>'}
     }
 
-    # 4. Convert - ADD the io_type here as well to be safe
     hls_model = hls4ml.converters.convert_from_pytorch_model(
         model,
         input_shape=INPUT_SHAPE,
@@ -111,7 +104,7 @@ def convert_pytorch(model, output_dir):
         output_dir=output_dir,
         backend="Vitis",
         part=FPGA_PART,
-        io_type='io_stream', # Matches the config above
+        io_type='io_stream',
     )
 
     return hls_model
