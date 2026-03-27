@@ -72,7 +72,10 @@ def convert_pytorch(model, output_dir):
 
     # 2. Global settings
     config["Model"]["IOType"] = "io_stream" # Critical for U-Nets
-    config["Model"]["Strategy"] = "Latency" # Or 'Resource' if it's too big
+    # config["Model"]["Strategy"] = "Latency" # Or 'Resource' if it's too big
+
+    config['Model']['Precision'] = 'ap_fixed<32,16>' # Very wide for debugging
+    config['Model']['Strategy'] = 'Resource'        # Resource strategy is often more stable for C-Sim
 
     # 3. Patch the Layer Config
     if "LayerName" not in config:
@@ -84,9 +87,21 @@ def convert_pytorch(model, output_dir):
             config["LayerName"][layer_name]["ReuseFactor"] = 8 # Example value
         
         # Sigmoid tuning
-        if "sigmoid" in layer_name.lower():
-            config["LayerName"][layer_name]["table_size"] = 1024 # Standard size
-            config["LayerName"][layer_name]["Precision"] = "ap_fixed<16,6>"
+        if 'sigmoid' in layer_name.lower():
+                config['LayerName'][layer_name]['Precision'] = 'ap_fixed<16,6>'
+                config['LayerName'][layer_name]['table_size'] = 2048 # Double the size
+                # table_t defines the input range of the LUT. 
+                # ap_fixed<18,8> allows inputs up to +255, -255
+                config['LayerName'][layer_name]['table_t'] = 'ap_fixed<18,8>'
+
+
+    config['LayerType'] = {
+        'Conv2D': {'Precision': 'ap_fixed<32,16>'},
+        'Activation': {'Precision': 'ap_fixed<32,16>'},
+        'Concatenate': {'Precision': 'ap_fixed<32,16>'},
+        'Resize': {'Precision': 'ap_fixed<32,16>'},
+        'Merge': {'Precision': 'ap_fixed<32,16>'}
+    }
 
     # 4. Convert - ADD the io_type here as well to be safe
     hls_model = hls4ml.converters.convert_from_pytorch_model(
