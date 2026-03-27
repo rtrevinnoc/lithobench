@@ -51,35 +51,44 @@ def load_and_fuse(weights_path):
 def convert_pytorch(model, output_dir):
     """Convert MiniUNet via hls4ml's PyTorch frontend."""
     import hls4ml
+    import torch
 
+    # Ensure model is in eval mode and on CPU
+    model.eval()
+    model.cpu()
+
+    # 1. Generate config with 'full' channels-last conversion.
+    # This automatically handles the NCHW (Torch) to NHWC (FPGA) logic.
     config = hls4ml.utils.config_from_pytorch_model(
         model,
-        input_shape=INPUT_SHAPE,
+        input_shape=INPUT_SHAPE, # Should be [1, 1, 64, 64]
         granularity="name",
         backend="Vitis",
         default_precision=DEFAULT_PRECISION,
-        default_reuse_factor=DEFAULT_REUSE_FACTOR,
+        # This is the "magic" flag for U-Nets in hls4ml
+        channels_last_conversion='full', 
+        transpose_outputs=True
     )
 
-    # Global settings
-    config["Model"]["IOType"] = IO_TYPE
-    config["Model"]["Strategy"] = STRATEGY
+    # 2. Global settings
+    config["Model"]["IOType"] = "io_stream" # Critical for U-Nets
+    config["Model"]["Strategy"] = "Latency" # Or 'Resource' if it's too big
 
-    # Increase reuse factor for bottleneck layers to fit DSP budget
-    for layer_name in config.get("LayerName", {}):
+    # 3. Patch the Layer Config
+    if "LayerName" not in config:
+        config["LayerName"] = {}
+
+    for layer_name in list(config.get("LayerName", {}).keys()):
+        # Increase reuse factor for bottleneck to save DSPs
         if "conv4" in layer_name:
-            config["LayerName"][layer_name]["ReuseFactor"] = BOTTLENECK_REUSE_FACTOR
-
-    # Sigmoid lookup table configuration
-    for layer_name in config.get("LayerName", {}):
+            config["LayerName"][layer_name]["ReuseFactor"] = 8 # Example value
+        
+        # Sigmoid tuning
         if "sigmoid" in layer_name.lower():
-            config["LayerName"][layer_name]["table_size"] = 512
-            config["LayerName"][layer_name]["table_t"] = "ap_fixed<10,6>"
+            config["LayerName"][layer_name]["table_size"] = "1024" # Standard size
+            config["LayerName"][layer_name]["Precision"] = "ap_fixed<16,6>"
 
-    import pprint
-    print("hls4ml configuration:")
-    pprint.pprint(config)
-
+    # 4. Convert - ADD the io_type here as well to be safe
     hls_model = hls4ml.converters.convert_from_pytorch_model(
         model,
         input_shape=INPUT_SHAPE,
@@ -87,7 +96,7 @@ def convert_pytorch(model, output_dir):
         output_dir=output_dir,
         backend="Vitis",
         part=FPGA_PART,
-        clock_period=CLOCK_PERIOD,
+        io_type='io_stream', # Matches the config above
     )
 
     return hls_model
