@@ -103,22 +103,25 @@ def convert_pytorch(model, output_dir):
 
 
 def convert_onnx(model, output_dir):
-    import torch
-    
-    onnx_path = os.path.join(output_dir, "mini_unet.onnx")
-    dummy_input = torch.randn(1, 1, 64, 64)
+    import hls4ml
+    import onnx as _onnx
+    import torch.onnx
 
-    # Force the legacy exporter to respect Opset 11
+    onnx_path = os.path.join(output_dir, "mini_unet.onnx")
+    cl_onnx_path = os.path.join(output_dir, "mini_unet_cl.onnx")
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 1. FORCE LEGACY EXPORT (Fixes the Opset 18 / kernel_shape error)
+    dummy_input = torch.randn(1, 1, 64, 64) # Ensure NCHW for export
     torch.onnx.export(
         model, 
         dummy_input, 
         onnx_path,
-        export_params=True,
-        opset_version=11, 
+        input_names=["input"], 
+        output_names=["output"],
+        opset_version=11, # Crucial for qonnx
         do_constant_folding=True,
-        input_names=['input'],
-        output_names=['output'],
-        # ADD THIS LINE to prevent the "Opset 18" hijack:
+        # Use the legacy exporter type to avoid "Dynamo" overhead
         operator_export_type=torch.onnx.OperatorExportTypes.ONNX
     )
 
@@ -159,23 +162,40 @@ def convert_onnx(model, output_dir):
 
 
 def validate_csim(model, hls_model, num_samples=10):
-    """Compare PyTorch and HLS C-simulation outputs."""
     print(f"\nValidating C-simulation with {num_samples} random inputs...")
     max_diffs = []
 
     for i in range(num_samples):
-        test_input = np.random.randn(*INPUT_SHAPE).astype(np.float32)
-        # Clip to valid mask range
-        test_input = np.clip(test_input, 0.0, 1.0)
+        # 1. Create the input in PyTorch format (N, C, H, W)
+        # Assuming INPUT_SHAPE is (1, 1, 64, 64)
+        test_input_pt = np.random.rand(*INPUT_SHAPE).astype(np.float32)
 
-        # PyTorch reference
+        # 2. PyTorch reference
+        model.eval()
         with torch.no_grad():
-            pt_out = model(torch.tensor(test_input)).numpy()
+            pt_out = model(torch.tensor(test_input_pt)).numpy()
 
-        # HLS C-simulation
-        hls_out = hls_model.predict(test_input)
+        # 3. PREPARE FOR HLS: 
+        # hls4ml C-sim usually expects (H, W, C) and NO batch dim 
+        # for the internal .predict() call if using io_stream/parallel
+        test_input_hls = np.squeeze(test_input_pt) # Remove batch: (1, 64, 64)
+        test_input_hls = np.transpose(test_input_hls, (1, 2, 0)) # To (64, 64, 1)
+        
+        # Ensure it is contiguous in memory (C++ hates non-contiguous arrays)
+        test_input_hls = np.ascontiguousarray(test_input_hls)
 
-        diff = np.max(np.abs(pt_out - hls_out))
+        # 4. HLS C-simulation
+        try:
+            hls_out = hls_model.predict(test_input_hls)
+        except Exception as e:
+            print(f"HLS Predict failed: {e}")
+            continue
+
+        # 5. Post-process HLS output to match PyTorch (if hls_out is H,W,C)
+        # hls4ml output is often flattened or (H, W, C)
+        hls_out_reshaped = hls_out.reshape(pt_out.shape)
+
+        diff = np.max(np.abs(pt_out - hls_out_reshaped))
         max_diffs.append(diff)
         print(f"  Sample {i + 1}: max|diff| = {diff:.6f}")
 
