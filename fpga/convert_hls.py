@@ -107,7 +107,7 @@ def convert_onnx(model, output_dir):
         onnx_path,
         input_names=["input"],
         output_names=["output"],
-        opset_version=11,
+        opset_version=10,  # opset 10 Resize takes (X, scales) — no ROI input
         dynamic_axes=None,
         dynamo=False,
     )
@@ -147,45 +147,9 @@ def convert_onnx(model, output_dir):
             _proto.graph.output.remove(_out)
             _proto.graph.output.insert(_i, _new_out)
             _changed = True
-    # PyTorch exports an empty ROI initializer for nearest-neighbour Resize (the ROI
-    # is unused in that mode). hls4ml's get_input_shape needs to find the initializer
-    # by name, so keep it as a named tensor — but replace the empty array with 8 zeros
-    # so the initializer has a valid shape. The boolean check issue in
-    # resize_remove_constants is handled by the monkeypatch applied before conversion.
-    import numpy as _np
-    for _node in _proto.graph.node:
-        if _node.op_type == 'Resize' and len(_node.input) > 1 and _node.input[1]:
-            for _j, _init in enumerate(_proto.graph.initializer):
-                if _init.name == _node.input[1]:
-                    if _onnx.numpy_helper.to_array(_init).size == 0:
-                        _dummy = _np.zeros(8, dtype=_np.float32)
-                        _proto.graph.initializer[_j].CopyFrom(
-                            _onnx.numpy_helper.from_array(_dummy, name=_init.name)
-                        )
-                        _changed = True
-
     if _changed:
         _onnx.save(_proto, cl_onnx_path)
         print("Patched empty node/output names in channels-last ONNX")
-
-    # hls4ml's resize_remove_constants does `if roi_node.get_attr('value'):` which
-    # raises ValueError for any multi-element numpy array in NumPy >= 1.25.
-    # Monkeypatch the transform method to use np.any() instead.
-    try:
-        import inspect, textwrap as _tw, numpy as _np_fix
-        import hls4ml.model.optimizer.passes.resize_remove_constants as _rrc
-        _src = _tw.dedent(inspect.getsource(_rrc.ResizeRemoveConstants.transform))
-        _fixed = _src.replace(
-            "if roi_node.get_attr('value'):",
-            "if roi_node is not None and len(_np_fix.asarray(roi_node.get_attr('value')).ravel()) > 0:",
-        )
-        if _fixed != _src:
-            _exec_ns = {**vars(_rrc), '_np_fix': _np_fix}
-            exec(compile(_fixed, '<fix_resize>', 'exec'), _exec_ns)
-            _rrc.ResizeRemoveConstants.transform = _exec_ns['transform']
-            print("Applied numpy compatibility patch to hls4ml ResizeRemoveConstants")
-    except Exception as _patch_err:
-        print(f"Warning: Could not patch ResizeRemoveConstants: {_patch_err}")
 
     config = {
         "Model": {
