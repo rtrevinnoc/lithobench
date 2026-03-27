@@ -107,7 +107,7 @@ def convert_onnx(model, output_dir):
         input_names=["input"], output_names=["output"],
         opset_version=11,
         do_constant_folding=True,
-        operator_export_type=torch.onnx.OperatorExportTypes.ONNX
+        operator_export_type=torch.onnx.OperatorExportTypes.ONNX_ATEN_FALLBACK
     )
 
     # 2. OPTIONAL CLEANUP (Try-Except)
@@ -132,6 +132,10 @@ def convert_onnx(model, output_dir):
 
     config["Model"]["IOType"] = IO_TYPE
     config["Model"]["Strategy"] = STRATEGY
+    config['SkipOptimizers'] = ['transpose_optimizer'] 
+    
+    # Force the model to be treated as Channels-Last from the start
+    config['Model']['ChannelsLast'] = True
     
     # Fix the UnspecifiedPrecisionType from earlier
     if "LayerType" not in config: config["LayerType"] = {}
