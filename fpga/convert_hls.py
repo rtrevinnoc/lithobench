@@ -85,7 +85,7 @@ def convert_pytorch(model, output_dir):
         
         # Sigmoid tuning
         if "sigmoid" in layer_name.lower():
-            config["LayerName"][layer_name]["table_size"] = "1024" # Standard size
+            config["LayerName"][layer_name]["table_size"] = 1024 # Standard size
             config["LayerName"][layer_name]["Precision"] = "ap_fixed<16,6>"
 
     # 4. Convert - ADD the io_type here as well to be safe
@@ -103,25 +103,22 @@ def convert_pytorch(model, output_dir):
 
 
 def convert_onnx(model, output_dir):
-    import hls4ml
-    import onnx as _onnx
-    import torch.onnx
-
+    import torch
+    
     onnx_path = os.path.join(output_dir, "mini_unet.onnx")
-    cl_onnx_path = os.path.join(output_dir, "mini_unet_cl.onnx")
-    os.makedirs(output_dir, exist_ok=True)
+    dummy_input = torch.randn(1, 1, 64, 64)
 
-    # 1. FORCE LEGACY EXPORT (Fixes the Opset 18 / kernel_shape error)
-    dummy_input = torch.randn(1, 1, 64, 64) # Ensure NCHW for export
+    # Force the legacy exporter to respect Opset 11
     torch.onnx.export(
         model, 
         dummy_input, 
         onnx_path,
-        input_names=["input"], 
-        output_names=["output"],
-        opset_version=11, # Crucial for qonnx
+        export_params=True,
+        opset_version=11, 
         do_constant_folding=True,
-        # Use the legacy exporter type to avoid "Dynamo" overhead
+        input_names=['input'],
+        output_names=['output'],
+        # ADD THIS LINE to prevent the "Opset 18" hijack:
         operator_export_type=torch.onnx.OperatorExportTypes.ONNX
     )
 
