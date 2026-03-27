@@ -96,59 +96,58 @@ def convert_pytorch(model, output_dir):
 def convert_onnx(model, output_dir):
     import hls4ml
     import onnx as _onnx
+    import torch.onnx
 
     onnx_path = os.path.join(output_dir, "mini_unet.onnx")
+    cl_onnx_path = os.path.join(output_dir, "mini_unet_cl.onnx")
     os.makedirs(output_dir, exist_ok=True)
 
-    # 1. CLEAN EXPORT
-    dummy_input = torch.randn(*INPUT_SHAPE)
+    # 1. FORCE LEGACY EXPORT (Fixes the Opset 18 / kernel_shape error)
+    dummy_input = torch.randn(1, 1, 64, 64) # Ensure NCHW for export
     torch.onnx.export(
-        model, dummy_input, onnx_path,
-        input_names=["input"], output_names=["output"],
-        opset_version=11,
+        model, 
+        dummy_input, 
+        onnx_path,
+        input_names=["input"], 
+        output_names=["output"],
+        opset_version=11, # Crucial for qonnx
         do_constant_folding=True,
-        operator_export_type=torch.onnx.OperatorExportTypes.ONNX_ATEN_FALLBACK
+        # Use the legacy exporter type to avoid "Dynamo" overhead
+        operator_export_type=torch.onnx.OperatorExportTypes.ONNX
     )
 
-    # 2. OPTIONAL CLEANUP (Try-Except)
-    # If qonnx fails, we proceed with the raw ONNX which hls4ml can often handle anyway
-    cl_onnx_path = onnx_path.replace(".onnx", "_cl.onnx")
+    # 2. CHANNELS LAST CONVERSION
+    # We must run this, or hls4ml will refuse the ONNX model
     try:
         subprocess.run(["qonnx-cleanup", onnx_path, "--out-file", onnx_path], check=True)
         subprocess.run(["qonnx-to-channels-last", "--make-input-channels-last", 
                         f"--out-file={cl_onnx_path}", onnx_path], check=True)
-    except Exception as e:
-        print(f"QONNX Cleanup failed: {e}. Attempting direct conversion...")
-        cl_onnx_path = onnx_path 
+    except subprocess.CalledProcessError:
+        print("CRITICAL: qonnx failed. Your model likely has incompatible reshapes/squeezes.")
+        raise
 
-    # 3. ROBUST CONFIG
+    # 3. CONFIGURE HLS4ML
     model_proto = _onnx.load(cl_onnx_path)
     config = hls4ml.utils.config_from_onnx_model(
         model_proto,
-        default_precision=DEFAULT_PRECISION,
-        default_reuse_factor=DEFAULT_REUSE_FACTOR,
+        default_precision='ap_fixed<16,6>',
         backend="Vitis"
     )
 
-    config["Model"]["IOType"] = IO_TYPE
-    config["Model"]["Strategy"] = STRATEGY
-    config['SkipOptimizers'] = ['transpose_optimizer'] 
+    # BYPASS THE CRASHING OPTIMIZER
+    config['SkipOptimizers'] = ['transpose_optimizer']
+    config["Model"]["IOType"] = "io_stream"
     
-    # Force the model to be treated as Channels-Last from the start
-    config['Model']['ChannelsLast'] = True
-    
-    # Fix the UnspecifiedPrecisionType from earlier
+    # Catch-all for precision errors
     if "LayerType" not in config: config["LayerType"] = {}
-    config["LayerType"]["Precision"] = DEFAULT_PRECISION
+    config["LayerType"]["Precision"] = 'ap_fixed<16,6>'
 
-    # 4. CONVERT
     hls_model = hls4ml.converters.convert_from_onnx_model(
         model_proto,
         hls_config=config,
         output_dir=output_dir,
         backend="Vitis",
         part=FPGA_PART,
-        clock_period=CLOCK_PERIOD,
     )
     return hls_model
 
