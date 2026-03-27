@@ -148,11 +148,10 @@ def convert_onnx(model, output_dir):
             _proto.graph.output.insert(_i, _new_out)
             _changed = True
     # hls4ml's resize_remove_constants does `if roi_node.get_attr('value'):` which
-    # raises ValueError on an empty numpy array. PyTorch always exports an empty ROI
-    # tensor for nearest-neighbour Resize (the value is never used in that mode).
-    # Replace every empty ROI initializer with an all-zeros placeholder so the truth
-    # check passes. 8 elements = start+end for each of the 4 input dimensions.
-    import numpy as _np
+    # raises ValueError for any multi-element numpy array. PyTorch always exports an
+    # empty ROI tensor for nearest-neighbour Resize (unused in that mode). Clear the
+    # node's ROI input name to "" (ONNX convention for "optional input not provided")
+    # so hls4ml never looks up the ROI node and the check is never reached.
     for _node in _proto.graph.node:
         if _node.op_type == 'Resize' and len(_node.input) > 1 and _node.input[1]:
             for _j, _init in enumerate(_proto.graph.initializer):
