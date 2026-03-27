@@ -107,7 +107,7 @@ def convert_onnx(model, output_dir):
         onnx_path,
         input_names=["input"],
         output_names=["output"],
-        opset_version=10,
+        opset_version=11,
         dynamic_axes=None,
         dynamo=False,
     )
@@ -147,6 +147,23 @@ def convert_onnx(model, output_dir):
             _proto.graph.output.remove(_out)
             _proto.graph.output.insert(_i, _new_out)
             _changed = True
+    # hls4ml's resize_remove_constants does `if roi_node.get_attr('value'):` which
+    # raises ValueError on an empty numpy array. PyTorch always exports an empty ROI
+    # tensor for nearest-neighbour Resize (the value is never used in that mode).
+    # Replace every empty ROI initializer with an all-zeros placeholder so the truth
+    # check passes. 8 elements = start+end for each of the 4 input dimensions.
+    import numpy as _np
+    for _node in _proto.graph.node:
+        if _node.op_type == 'Resize' and len(_node.input) > 1 and _node.input[1]:
+            for _j, _init in enumerate(_proto.graph.initializer):
+                if _init.name == _node.input[1]:
+                    if _onnx.numpy_helper.to_array(_init).size == 0:
+                        _dummy = _np.zeros(8, dtype=_np.float32)
+                        _proto.graph.initializer[_j].CopyFrom(
+                            _onnx.numpy_helper.from_array(_dummy, name=_init.name)
+                        )
+                        _changed = True
+
     if _changed:
         _onnx.save(_proto, cl_onnx_path)
         print("Patched empty node/output names in channels-last ONNX")
