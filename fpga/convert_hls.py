@@ -76,9 +76,9 @@ def convert_pytorch(model, output_dir):
             config["LayerName"][layer_name]["table_size"] = 512
             config["LayerName"][layer_name]["table_t"] = "ap_fixed<10,6>"
 
-    import json
+    import pprint
     print("hls4ml configuration:")
-    print(json.dumps(config, indent=2))
+    pprint.pprint(config)
 
     hls_model = hls4ml.converters.convert_from_pytorch_model(
         model,
@@ -147,6 +147,24 @@ def convert_onnx(model, output_dir):
             _proto.graph.output.remove(_out)
             _proto.graph.output.insert(_i, _new_out)
             _changed = True
+    # hls4ml's resize_remove_constants optimizer does `if roi_node.get_attr('value'):`
+    # which raises ValueError when the ROI input is an empty numpy array (always the
+    # case for nearest-neighbour Resize exported by PyTorch). Clear the ROI input slot
+    # so hls4ml never tries to evaluate it.
+    _roi_init_names = set()
+    for _node in _proto.graph.node:
+        if _node.op_type == 'Resize' and len(_node.input) > 1 and _node.input[1]:
+            for _init in _proto.graph.initializer:
+                if _init.name == _node.input[1]:
+                    import numpy as _np
+                    if _onnx.numpy_helper.to_array(_init).size == 0:
+                        _roi_init_names.add(_init.name)
+                        _node.input[1] = ''
+                        _changed = True
+    for _init in list(_proto.graph.initializer):
+        if _init.name in _roi_init_names:
+            _proto.graph.initializer.remove(_init)
+
     if _changed:
         _onnx.save(_proto, cl_onnx_path)
         print("Patched empty node/output names in channels-last ONNX")
