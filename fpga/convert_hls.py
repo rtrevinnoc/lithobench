@@ -64,7 +64,8 @@ def convert_pytorch(model, output_dir):
         backend="Vitis",
         default_precision="ap_fixed<16,6>", # Standard for HLS DL
         channels_last_conversion='full', 
-        transpose_outputs=True
+        transpose_outputs=True,
+        default_reuse_factor=128
     )
 
     # 2. Global settings
@@ -76,9 +77,11 @@ def convert_pytorch(model, output_dir):
         config["LayerName"] = {}
 
     for layer_name in list(config.get("LayerName", {}).keys()):
-        # Bottleneck: Increase ReuseFactor to save DSPs if timing is hard to meet
-        if "conv4" in layer_name:
-            config["LayerName"][layer_name]["ReuseFactor"] = 16 
+        if 'conv' in layer_name or 'up' in layer_name:
+                # If the layer is deep, make it share even more
+                config['LayerName'][layer_name]['ReuseFactor'] = 256 
+                # Use "Resource" strategy specifically for these
+                config['LayerName'][layer_name]['Strategy'] = 'Resource'
         
         # Sigmoid: Keep the "Hardened" LUT to prevent C-Sim crashes/NaNs
         if 'sigmoid' in layer_name.lower():
