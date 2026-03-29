@@ -90,6 +90,13 @@ def convert_pytorch(model, output_dir):
             # Wider table_t allows the LUT to handle larger activation swings
             config['LayerName'][layer_name]['table_t'] = 'ap_fixed<18,8>'
 
+    config['Model']['HLSDirectives'] = {
+        'myproject': [
+            {'name': 'expression_balance', 'value': 'off'},
+            {'name': 'occurrence', 'value': 'off'}
+        ]
+    }
+
     # 4. Critical: Downsize the LayerType defaults
     # This ensures skip-connections and resizes don't waste 32-bit registers
     config['LayerType'] = {
