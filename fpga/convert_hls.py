@@ -37,23 +37,28 @@ INPUT_SHAPE = (1, 1, 64, 64)  # (batch, channels, height, width)
 
 
 def _patch_tcl(output_dir: str) -> None:
-    """Inject config_compile directives into the generated build script.
+    """Remove hls4ml-generated TCL commands that are invalid in Vitis HLS 2024.1.
 
-    hls4ml's HLSDirectives config key does not produce config_compile TCL
-    commands, so we patch the file directly after project generation.
+    config_array_partition -maximum_size and config_compile -expression_balance
+    were removed in Vitis 2024.1 and cause synthesis to abort if present.
     """
     tcl_path = os.path.join(output_dir, "build_prj.tcl")
     if not os.path.exists(tcl_path):
         return
     with open(tcl_path) as f:
         content = f.read()
-    directive = "config_compile -expression_balance off\n"
-    if directive in content:
-        return  # already patched
-    content = content.replace("csynth_design", directive + "csynth_design", 1)
-    with open(tcl_path, "w") as f:
-        f.write(content)
-    print(f"Patched {tcl_path}: added config_compile -expression_balance off")
+    patched = False
+    for bad_line in [
+        "config_array_partition -maximum_size 4096\n",
+        "config_compile -expression_balance off\n",
+    ]:
+        if bad_line in content:
+            content = content.replace(bad_line, "")
+            patched = True
+    if patched:
+        with open(tcl_path, "w") as f:
+            f.write(content)
+        print(f"Patched {tcl_path}: removed invalid 2024.1 TCL commands")
 
 
 def load_and_fuse(weights_path):
@@ -99,7 +104,7 @@ def convert_pytorch(model, output_dir):
     for layer_name in list(config.get("LayerName", {}).keys()):
         if 'conv' in layer_name or 'up' in layer_name:
                 # If the layer is deep, make it share even more
-                config['LayerName'][layer_name]['ReuseFactor'] = 128
+                config['LayerName'][layer_name]['ReuseFactor'] = 64
                 # Use "Resource" strategy specifically for these
                 config['LayerName'][layer_name]['Strategy'] = 'Resource'
         
