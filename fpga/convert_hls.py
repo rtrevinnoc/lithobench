@@ -36,6 +36,26 @@ STRATEGY = "Resource"
 INPUT_SHAPE = (1, 1, 64, 64)  # (batch, channels, height, width)
 
 
+def _patch_tcl(output_dir: str) -> None:
+    """Inject config_compile directives into the generated build script.
+
+    hls4ml's HLSDirectives config key does not produce config_compile TCL
+    commands, so we patch the file directly after project generation.
+    """
+    tcl_path = os.path.join(output_dir, "build_prj.tcl")
+    if not os.path.exists(tcl_path):
+        return
+    with open(tcl_path) as f:
+        content = f.read()
+    directive = "config_compile -expression_balance off\n"
+    if directive in content:
+        return  # already patched
+    content = content.replace("csynth_design", directive + "csynth_design", 1)
+    with open(tcl_path, "w") as f:
+        f.write(content)
+    print(f"Patched {tcl_path}: added config_compile -expression_balance off")
+
+
 def load_and_fuse(weights_path):
     """Load MiniUNet weights and fuse BatchNorm into Conv2d."""
     model = MiniUNet()
@@ -79,7 +99,7 @@ def convert_pytorch(model, output_dir):
     for layer_name in list(config.get("LayerName", {}).keys()):
         if 'conv' in layer_name or 'up' in layer_name:
                 # If the layer is deep, make it share even more
-                config['LayerName'][layer_name]['ReuseFactor'] = 256 
+                config['LayerName'][layer_name]['ReuseFactor'] = 64
                 # Use "Resource" strategy specifically for these
                 config['LayerName'][layer_name]['Strategy'] = 'Resource'
         
@@ -89,13 +109,6 @@ def convert_pytorch(model, output_dir):
             config['LayerName'][layer_name]['table_size'] = 2048
             # Wider table_t allows the LUT to handle larger activation swings
             config['LayerName'][layer_name]['table_t'] = 'ap_fixed<18,8>'
-
-    config['Model']['HLSDirectives'] = {
-        'myproject': [
-            {'name': 'expression_balance', 'value': 'off'},
-            {'name': 'occurrence', 'value': 'off'}
-        ]
-    }
 
     # 4. Critical: Downsize the LayerType defaults
     # This ensures skip-connections and resizes don't waste 32-bit registers
@@ -117,6 +130,7 @@ def convert_pytorch(model, output_dir):
         io_type='io_stream',
     )
 
+    _patch_tcl(output_dir)
     return hls_model
 
 
