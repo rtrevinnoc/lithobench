@@ -99,7 +99,7 @@ def convert_pytorch(model, output_dir):
     for layer_name in list(config.get("LayerName", {}).keys()):
         if 'conv' in layer_name or 'up' in layer_name:
                 # If the layer is deep, make it share even more
-                config['LayerName'][layer_name]['ReuseFactor'] = 64
+                config['LayerName'][layer_name]['ReuseFactor'] = 128
                 # Use "Resource" strategy specifically for these
                 config['LayerName'][layer_name]['Strategy'] = 'Resource'
         
@@ -285,6 +285,7 @@ def main():
         validate_csim(model, hls_model)
 
     if args.synth:
+        _patch_tcl(args.output_dir)
         print("\nRunning Vitis HLS synthesis (this may take a while)...")
         report = hls_model.build(csim=False, synth=True, cosim=args.cosim)
         print("\nSynthesis complete. Reading report...")
