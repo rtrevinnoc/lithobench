@@ -70,7 +70,7 @@ fi
 # Step 2: Create CL project from template
 # ---------------------------------------------------------------------------
 
-TEMPLATE_DIR="${HDK_DIR}/cl/developer_designs/CL_TEMPLATE"
+TEMPLATE_DIR="${HDK_DIR}/cl/examples/CL_TEMPLATE"
 
 if [ ! -d "${TEMPLATE_DIR}" ]; then
     echo "ERROR: CL_TEMPLATE not found at ${TEMPLATE_DIR}"
