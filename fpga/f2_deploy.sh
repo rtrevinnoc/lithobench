@@ -104,53 +104,79 @@ fi
 echo "  HLS IP installed at ${IP_DIR}"
 
 # ---------------------------------------------------------------------------
-# Step 4: Generate wrapper (instructions)
+# Step 4: Copy cl_top.sv (AXI bridge + BRAM + FSM) into CL design dir
 # ---------------------------------------------------------------------------
 
-cat <<'WRAPPER_INFO'
+# cl_top.sv lives alongside this script in fpga/host/
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CL_TOP_SRC="${SCRIPT_DIR}/host/cl_top.sv"
+CL_DESIGN_DIR="${CL_DIR}/design"
 
-=== Next Steps (Manual Integration) ===
+if [ -f "${CL_TOP_SRC}" ]; then
+    echo "Copying cl_top.sv to CL design directory..."
+    cp "${CL_TOP_SRC}" "${CL_DESIGN_DIR}/cl_top.sv"
+    echo "  Installed ${CL_DESIGN_DIR}/cl_top.sv"
+else
+    echo "WARNING: ${CL_TOP_SRC} not found. cl_top.sv must be installed manually."
+fi
 
-The HLS IP has been copied into the CL project. You now need to:
+# ---------------------------------------------------------------------------
+# Step 5: Patch synth_cl.tcl to include HLS IP and cl_top.sv
+# ---------------------------------------------------------------------------
 
-1. Edit the CL top-level to instantiate the HLS IP:
-   File: ${CL_DIR}/design/cl_top.sv
+SYNTH_TCL="${CL_DIR}/build/scripts/synth_cl.tcl"
 
-   Connect the HLS module's AXI interfaces:
-   - AXI-Lite slave (ap_ctrl) -> OCL BAR0 (register control)
-   - AXI-Stream / AXI-MM input -> PCIS (tile data from host)
-   - AXI-Stream / AXI-MM output -> PCIS (tile results to host)
+if [ ! -f "${SYNTH_TCL}" ]; then
+    echo "WARNING: ${SYNTH_TCL} not found. Skipping TCL patch."
+elif grep -q "mini_unet_hls" "${SYNTH_TCL}"; then
+    echo "synth_cl.tcl already patched, skipping."
+else
+    echo "Patching ${SYNTH_TCL} to include HLS IP files and cl_top.sv..."
+    cat >> "${SYNTH_TCL}" << 'TCL_PATCH'
 
-2. Add the HLS IP files to the build file list:
-   File: ${CL_DIR}/build/scripts/synth_cl.tcl
+# ---- hls4ml MiniUNet HLS IP (added by f2_deploy.sh) ----
+set HLS_IP_DIR [file join $env(CL_DIR) design ip mini_unet_hls]
+if {[llength [glob -nocomplain [file join $HLS_IP_DIR *.v]]] > 0} {
+    read_verilog -sv [glob [file join $HLS_IP_DIR *.v]]
+}
+if {[llength [glob -nocomplain [file join $HLS_IP_DIR *.sv]]] > 0} {
+    read_verilog -sv [glob [file join $HLS_IP_DIR *.sv]]
+}
+set_property include_dirs [list $HLS_IP_DIR] [current_fileset]
+read_verilog -sv [file join $env(CL_DIR) design cl_top.sv]
+set_property -name {xpm_libraries} -value {XPM_MEMORY XPM_CDC XPM_FIFO} \
+    -objects [current_project]
+TCL_PATCH
+    echo "  Patched ${SYNTH_TCL}"
+fi
 
-   Add:
-     read_verilog [glob ${CL_DIR}/design/ip/mini_unet_hls/*.v]
-     read_verilog [glob ${CL_DIR}/design/ip/mini_unet_hls/*.sv]
+# ---------------------------------------------------------------------------
+# Step 6: Verify HLS port names (reminder)
+# ---------------------------------------------------------------------------
 
-3. Implement the DMA tile transfer logic:
-   - Host writes 64x64x1 tile (4096 bytes at ap_fixed<8,4>) to FPGA via PCIS
-   - FPGA processes tile through HLS IP
-   - Host reads 64x64x1 result from FPGA via PCIS
-
-4. Build the DCP:
-   cd ${CL_DIR}/build/scripts
-   python3 aws_build_dcp_from_cl.py
-
-5. Create AFI from DCP:
-   aws ec2 create-fpga-image \
-     --name "mini-unet-ilt" \
-     --description "MiniUNet ILT mask optimizer" \
-     --input-storage-location Bucket=<your-bucket>,Key=<dcp-tar-path>
-
-6. Load AFI on F2 instance:
-   sudo fpga-load-local-image -S 0 -I <agfi-id>
-   sudo fpga-describe-local-image -S 0 -H
-
-WRAPPER_INFO
+HLS_TOP_V="${IP_DIR}/myproject.v"
+if [ -f "${HLS_TOP_V}" ]; then
+    echo ""
+    echo "=== HLS IP port list (verify against cl_top.sv instantiation) ==="
+    grep -n "input\|output\|inout" "${HLS_TOP_V}" | head -20
+    echo ""
+fi
 
 echo ""
 echo "=== CL project ready at ${CL_DIR} ==="
-echo "See the instructions above for manual integration steps."
+echo ""
+echo "Next steps:"
+echo "  1. Compare HLS port names above against the myproject instantiation"
+echo "     in ${CL_DESIGN_DIR}/cl_top.sv and update if they differ."
+echo "  2. Build the DCP:"
+echo "       cd ${CL_DIR}/build/scripts"
+echo "       python3 aws_build_dcp_from_cl.py"
+echo "  3. Create AFI:"
+echo "       aws ec2 create-fpga-image \\"
+echo "         --name mini-unet-ilt \\"
+echo "         --input-storage-location Bucket=<bucket>,Key=<dcp-tar>"
+echo "  4. Load AFI on F2:"
+echo "       sudo fpga-load-local-image -S 0 -I <agfi-id>"
+echo ""
 echo "For Vivado IPI (GUI) flow, see:"
 echo "  ${HDK_DIR}/hdk/docs/IPI-GUI-Vivado-Setup.md"

@@ -40,18 +40,19 @@ from fpga.tiled_inference import TiledInference
 class FPGANeuralILT(ModelILT):
     """FPGA-deployable NeuralILT using tiled MiniUNet.
 
-    In CPU/GPU mode, this runs the MiniUNet with tiled inference entirely in
-    PyTorch. For actual FPGA deployment, the model forward pass would be
-    replaced with DMA transfers to/from the F2 FPGA — see fpga/host/ for
-    the driver interface.
+    In CPU/GPU mode (use_fpga=False), this runs the MiniUNet with tiled
+    inference entirely in PyTorch. With use_fpga=True, each tile is sent
+    to the F2 FPGA via XDMA DMA — see fpga/host/driver.py.
 
     Args:
         size: Full image size (default 512x512, matching NeuralILT).
         tile_size: Tile size for inference (default 64).
         overlap: Overlap pixels per side (default 16).
+        use_fpga: If True, route run() through the FPGA XDMA driver.
+            Falls back to PyTorch if the FPGA device cannot be opened.
     """
 
-    def __init__(self, size=(512, 512), tile_size=64, overlap=16):
+    def __init__(self, size=(512, 512), tile_size=64, overlap=16, use_fpga=False):
         super().__init__(size=size, name="FPGANeuralILT")
         self.simLitho = litho.LithoSim("./config/lithosimple.txt")
         self.net = MiniUNet()
@@ -60,6 +61,30 @@ class FPGANeuralILT(ModelILT):
         self.tiler = TiledInference(
             tile_size=tile_size, overlap=overlap, image_size=size[0]
         )
+        self.use_fpga = use_fpga
+        self._fpga_driver = None
+        if use_fpga:
+            self._init_fpga()
+
+    def _init_fpga(self):
+        """Open the FPGA XDMA driver; fall back to PyTorch on failure."""
+        try:
+            from fpga.host.driver import FPGADriver
+            self._fpga_driver = FPGADriver()
+            self._fpga_driver.open()
+            print("[FPGANeuralILT] FPGA hardware mode enabled.")
+        except Exception as e:
+            print(f"[FPGANeuralILT] WARNING: could not open FPGA driver: {e}")
+            print("[FPGANeuralILT] Falling back to PyTorch CPU/GPU mode.")
+            self._fpga_driver = None
+            self.use_fpga = False
+
+    def __del__(self):
+        if self._fpga_driver is not None:
+            try:
+                self._fpga_driver.close()
+            except Exception:
+                pass
 
     def pretrain(self, train_loader, val_loader, epochs=1, batch_size=4,
                  checkpoint_dir=None, resume_checkpoint=None):
@@ -245,9 +270,34 @@ class FPGANeuralILT(ModelILT):
             Tensor of shape (H, W) — predicted mask for the first image in batch.
         """
         self.net.eval()
+        if self.use_fpga and self._fpga_driver is not None:
+            return self._run_fpga(target)
         device = next(self.net.parameters()).device
         output = self.tiler.run(target, self.net, batch_size=64, device=device)
         return output[0, 0].detach()
+
+    def _run_fpga(self, target):
+        """FPGA tiled inference: extract tiles → FPGA DMA → reassemble.
+
+        Processes all tiles sequentially (one FPGA invocation per tile).
+        Uses the same TiledInference.extract_tiles / reassemble as the
+        PyTorch path so outputs are numerically comparable.
+
+        Args:
+            target: Tensor of shape (1, 1, H, W).
+
+        Returns:
+            Tensor of shape (H, W) on CPU.
+        """
+        tiles, positions = self.tiler.extract_tiles(target.cpu())
+        results = []
+        for i in range(tiles.shape[0]):
+            tile_np = tiles[i, 0].numpy()                        # (64, 64) float32
+            out_np = self._fpga_driver.process_tile(tile_np)     # (64, 64) float32
+            results.append(torch.from_numpy(out_np).unsqueeze(0))  # (1, 64, 64)
+        tile_outputs = torch.stack(results, dim=0)               # (N, 1, 64, 64)
+        full = self.tiler.reassemble(tile_outputs, positions)    # (1, 1, H, W)
+        return full[0, 0].detach()
 
     def save(self, filenames):
         filename = filenames[0] if isinstance(filenames, list) else filenames
