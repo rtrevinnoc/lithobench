@@ -90,14 +90,15 @@ fi
 # Step 3: Copy HLS RTL into CL project
 # ---------------------------------------------------------------------------
 
-IP_DIR="${CL_DIR}/design/ip/mini_unet_hls"
-mkdir -p "${IP_DIR}"
+IP_DIR="${CL_DIR}/design"
 
 if [ -d "${HLS_RTL_DIR}" ]; then
-    echo "Copying HLS RTL to CL project..."
-    cp -r "${HLS_RTL_DIR}"/* "${IP_DIR}/"
+    echo "Copying HLS RTL to CL design directory..."
+    cp "${HLS_RTL_DIR}"/*.v  "${IP_DIR}/" 2>/dev/null || true
+    cp "${HLS_RTL_DIR}"/*.sv "${IP_DIR}/" 2>/dev/null || true
+    cp "${HLS_RTL_DIR}"/*.dat "${IP_DIR}/" 2>/dev/null || true
 elif [ -f "${HLS_EXPORT}" ]; then
-    echo "Extracting HLS export to CL project..."
+    echo "Extracting HLS export to CL design directory..."
     unzip -o "${HLS_EXPORT}" -d "${IP_DIR}/"
 fi
 
@@ -131,7 +132,7 @@ SCRIPTS_DIR="${CL_DIR}/build/scripts"
 SYNTH_TCL="${SCRIPTS_DIR}/synth_cl_mini_unet.tcl"
 TEMPLATE_TCL="${SCRIPTS_DIR}/synth_CL_TEMPLATE.tcl"
 
-if grep -q "mini_unet_hls" "${SYNTH_TCL}" 2>/dev/null; then
+if grep -q "xpm_libraries" "${SYNTH_TCL}" 2>/dev/null; then
     echo "synth_cl_mini_unet.tcl already patched, skipping."
 else
     if [ ! -f "${TEMPLATE_TCL}" ]; then
@@ -141,19 +142,12 @@ else
     echo "Creating synth_cl_mini_unet.tcl from template..."
     cp "${TEMPLATE_TCL}" "${SYNTH_TCL}"
 
-    echo "Appending HLS IP and cl_top.sv to synth_cl_mini_unet.tcl..."
+    # The HDK template already reads all .v/.sv from design/.
+    # We only need to enable XPM libraries for xpm_memory_sdpram used in the shell.
+    echo "Appending XPM library enable to synth_cl_mini_unet.tcl..."
     cat >> "${SYNTH_TCL}" << 'TCL_PATCH'
 
-# ---- hls4ml MiniUNet HLS IP (added by f2_deploy.sh) ----
-set HLS_IP_DIR [file join $env(CL_DIR) design ip mini_unet_hls]
-if {[llength [glob -nocomplain [file join $HLS_IP_DIR *.v]]] > 0} {
-    read_verilog -sv [glob [file join $HLS_IP_DIR *.v]]
-}
-if {[llength [glob -nocomplain [file join $HLS_IP_DIR *.sv]]] > 0} {
-    read_verilog -sv [glob [file join $HLS_IP_DIR *.sv]]
-}
-set_property include_dirs [list $HLS_IP_DIR] [current_fileset]
-read_verilog -sv [file join $env(CL_DIR) design cl_top.sv]
+# ---- Added by f2_deploy.sh ----
 set_property -name {xpm_libraries} -value {XPM_MEMORY XPM_CDC XPM_FIFO} \
     -objects [current_project]
 TCL_PATCH
