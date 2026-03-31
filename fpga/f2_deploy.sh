@@ -121,17 +121,27 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Step 5: Patch synth_cl.tcl to include HLS IP and cl_top.sv
+# Step 5: Create synth_cl_mini_unet.tcl from template and add HLS IP files
+#
+# The AWS build system expects synth_${CL}.tcl (i.e. synth_cl_mini_unet.tcl).
+# The CL_TEMPLATE provides synth_CL_TEMPLATE.tcl as the starting point.
 # ---------------------------------------------------------------------------
 
-SYNTH_TCL="${CL_DIR}/build/scripts/synth_cl.tcl"
+SCRIPTS_DIR="${CL_DIR}/build/scripts"
+SYNTH_TCL="${SCRIPTS_DIR}/synth_cl_mini_unet.tcl"
+TEMPLATE_TCL="${SCRIPTS_DIR}/synth_CL_TEMPLATE.tcl"
 
-if [ ! -f "${SYNTH_TCL}" ]; then
-    echo "WARNING: ${SYNTH_TCL} not found. Skipping TCL patch."
-elif grep -q "mini_unet_hls" "${SYNTH_TCL}"; then
-    echo "synth_cl.tcl already patched, skipping."
+if grep -q "mini_unet_hls" "${SYNTH_TCL}" 2>/dev/null; then
+    echo "synth_cl_mini_unet.tcl already patched, skipping."
 else
-    echo "Patching ${SYNTH_TCL} to include HLS IP files and cl_top.sv..."
+    if [ ! -f "${TEMPLATE_TCL}" ]; then
+        echo "ERROR: Template TCL not found at ${TEMPLATE_TCL}"
+        exit 1
+    fi
+    echo "Creating synth_cl_mini_unet.tcl from template..."
+    cp "${TEMPLATE_TCL}" "${SYNTH_TCL}"
+
+    echo "Appending HLS IP and cl_top.sv to synth_cl_mini_unet.tcl..."
     cat >> "${SYNTH_TCL}" << 'TCL_PATCH'
 
 # ---- hls4ml MiniUNet HLS IP (added by f2_deploy.sh) ----
@@ -147,7 +157,7 @@ read_verilog -sv [file join $env(CL_DIR) design cl_top.sv]
 set_property -name {xpm_libraries} -value {XPM_MEMORY XPM_CDC XPM_FIFO} \
     -objects [current_project]
 TCL_PATCH
-    echo "  Patched ${SYNTH_TCL}"
+    echo "  Created ${SYNTH_TCL}"
 fi
 
 # ---------------------------------------------------------------------------
@@ -169,8 +179,9 @@ echo "Next steps:"
 echo "  1. Compare HLS port names above against the myproject instantiation"
 echo "     in ${CL_DESIGN_DIR}/cl_top.sv and update if they differ."
 echo "  2. Build the DCP:"
+echo "       export CL_DIR=${CL_DIR}"
 echo "       cd ${CL_DIR}/build/scripts"
-echo "       python3 aws_build_dcp_from_cl.py"
+echo "       python3 aws_build_dcp_from_cl.py --cl cl_mini_unet"
 echo "  3. Create AFI:"
 echo "       aws ec2 create-fpga-image \\"
 echo "         --name mini-unet-ilt \\"
