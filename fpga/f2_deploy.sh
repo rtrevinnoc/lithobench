@@ -132,27 +132,40 @@ SCRIPTS_DIR="${CL_DIR}/build/scripts"
 SYNTH_TCL="${SCRIPTS_DIR}/synth_cl_mini_unet.tcl"
 TEMPLATE_TCL="${SCRIPTS_DIR}/synth_CL_TEMPLATE.tcl"
 
-if grep -q "xpm_libraries" "${SYNTH_TCL}" 2>/dev/null; then
-    echo "synth_cl_mini_unet.tcl already patched, skipping."
-else
-    if [ ! -f "${TEMPLATE_TCL}" ]; then
-        echo "ERROR: Template TCL not found at ${TEMPLATE_TCL}"
-        exit 1
-    fi
-    echo "Creating synth_cl_mini_unet.tcl from template..."
-    cp "${TEMPLATE_TCL}" "${SYNTH_TCL}"
-
-    # The HDK template already reads all .v/.sv from design/.
-    # We only need to enable XPM libraries for xpm_memory_sdpram used in the shell.
-    echo "Appending XPM library enable to synth_cl_mini_unet.tcl..."
-    cat >> "${SYNTH_TCL}" << 'TCL_PATCH'
-
-# ---- Added by f2_deploy.sh ----
-set_property -name {xpm_libraries} -value {XPM_MEMORY XPM_CDC XPM_FIFO} \
-    -objects [current_project]
-TCL_PATCH
-    echo "  Created ${SYNTH_TCL}"
+if [ ! -f "${TEMPLATE_TCL}" ]; then
+    echo "ERROR: Template TCL not found at ${TEMPLATE_TCL}"
+    exit 1
 fi
+
+echo "Creating synth_cl_mini_unet.tcl from template..."
+cp "${TEMPLATE_TCL}" "${SYNTH_TCL}"
+
+# The HDK template reads .v/.sv from ${src_post_enc_dir} (the encryption
+# staging dir), which only contains files listed in encrypt.tcl — NOT
+# the 290 HLS Verilog files we placed in design/.  We must add
+# read_verilog commands for those files BEFORE synth_design runs.
+#
+# Insert right before the first "#---- End of section replaced by User"
+# marker (i.e. inside the user-editable read_verilog block).
+
+awk '
+/^#---- End of section replaced by User ----/ && !done {
+    print ""
+    print "# ---- hls4ml MiniUNet HLS IP (added by f2_deploy.sh) ----"
+    print "set HLS_DESIGN_DIR [file join $env(CL_DIR) design]"
+    print "foreach f [glob -nocomplain [file join $HLS_DESIGN_DIR *.v]] {"
+    print "    read_verilog $f"
+    print "}"
+    print "set_property -name {xpm_libraries} -value {XPM_MEMORY XPM_CDC XPM_FIFO} \\"
+    print "    -objects [current_project]"
+    print "# ---- end hls4ml patch ----"
+    print ""
+    done=1
+}
+{ print }
+' "${SYNTH_TCL}" > "${SYNTH_TCL}.tmp" && mv "${SYNTH_TCL}.tmp" "${SYNTH_TCL}"
+
+echo "  Created ${SYNTH_TCL}"
 
 # ---------------------------------------------------------------------------
 # Step 6: Verify HLS port names (reminder)
