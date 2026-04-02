@@ -2,7 +2,7 @@
 // cl_top.sv — AWS F2 CL for MiniUNet HLS IP
 //
 // Based on CL_TEMPLATE.sv + verified against cl_ports.vh.
-// Module name must match --cl argument: cl_mini_unet.
+// Module name must match --cl argument: penumbra.
 // All port names taken directly from cl_ports.vh.
 //
 // HLS IP port list (from myproject.v):
@@ -24,7 +24,7 @@
 //   0x0C  ERROR_FLAGS R  reserved
 // ============================================================================
 
-module cl_mini_unet
+module penumbra
     #(
       parameter EN_DDR = 0,
       parameter EN_HBM = 0
@@ -34,7 +34,7 @@ module cl_mini_unet
     );
 
 `include "cl_id_defines.vh"
-`include "CL_TEMPLATE_defines.vh"
+`include "penumbra_defines.vh"
 
 // ============================================================================
 // Required shell outputs
@@ -604,4 +604,4 @@ myproject hls_ip (
     .layer42_out_TREADY  (hls_out_tready)
 );
 
-endmodule // cl_mini_unet
+endmodule // penumbra
