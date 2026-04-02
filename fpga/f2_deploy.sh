@@ -95,17 +95,25 @@ echo "CL project verified at ${CL_DIR}"
 # Step 3: Copy HLS RTL into CL design directory
 # ---------------------------------------------------------------------------
 
+DATA_DIR="${CL_DIR}/data"
+mkdir -p "${DATA_DIR}"
+
 if [ -d "${HLS_RTL_DIR}" ]; then
     echo "Copying HLS RTL to CL design directory..."
     cp "${HLS_RTL_DIR}"/*.v  "${CL_DESIGN_DIR}/" 2>/dev/null || true
     cp "${HLS_RTL_DIR}"/*.sv "${CL_DESIGN_DIR}/" 2>/dev/null || true
-    cp "${HLS_RTL_DIR}"/*.dat "${CL_DESIGN_DIR}/" 2>/dev/null || true
+    # .dat files are $readmemh weight/LUT tables — keep them OUT of design/
+    # so the simulation file-list auto-generator does not compile them.
+    cp "${HLS_RTL_DIR}"/*.dat "${DATA_DIR}/" 2>/dev/null || true
 elif [ -f "${HLS_EXPORT}" ]; then
     echo "Extracting HLS export to CL design directory..."
     unzip -o "${HLS_EXPORT}" -d "${CL_DESIGN_DIR}/"
+    # Move any .dat files out of design/
+    find "${CL_DESIGN_DIR}" -name '*.dat' -exec mv {} "${DATA_DIR}/" \;
 fi
 
-echo "  HLS IP installed at ${CL_DESIGN_DIR}"
+echo "  HLS RTL installed at ${CL_DESIGN_DIR}"
+echo "  HLS data files at ${DATA_DIR}"
 
 # ---------------------------------------------------------------------------
 # Step 4: Install penumbra.sv (AXI bridge + BRAM + FSM) as the CL top level
@@ -154,8 +162,14 @@ else
         print ""
         print "# ---- hls4ml MiniUNet HLS IP (added by f2_deploy.sh) ----"
         print "set HLS_DESIGN_DIR [file join $env(CL_DIR) design]"
+        print "set HLS_DATA_DIR   [file join $env(CL_DIR) data]"
         print "foreach f [glob -nocomplain [file join $HLS_DESIGN_DIR *.v]] {"
         print "    read_verilog $f"
+        print "}"
+        print "# Copy .dat weight/LUT files to the Vivado run directory so"
+        print "# $readmemh can resolve them during synthesis/elaboration."
+        print "foreach f [glob -nocomplain [file join $HLS_DATA_DIR *.dat]] {"
+        print "    file copy -force $f [pwd]"
         print "}"
         print "set_property -name {xpm_libraries} -value {XPM_MEMORY XPM_CDC XPM_FIFO} \\"
         print "    -objects [current_project]"
