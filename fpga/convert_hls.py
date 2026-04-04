@@ -90,7 +90,7 @@ def convert_pytorch(model, output_dir):
         default_precision="ap_fixed<16,6>", # Standard for HLS DL
         channels_last_conversion='internal',
         transpose_outputs=False,
-        default_reuse_factor=128
+        default_reuse_factor=64
     )
 
     # 2. Global settings
@@ -103,9 +103,13 @@ def convert_pytorch(model, output_dir):
 
     for layer_name in list(config.get("LayerName", {}).keys()):
         if 'conv' in layer_name or 'up' in layer_name:
-                # If the layer is deep, make it share even more
-                config['LayerName'][layer_name]['ReuseFactor'] = 64
-                # Use "Resource" strategy specifically for these
+                # final_conv is a small 1x1 pointwise conv (valid RFs: 1,2,4,8)
+                # Using RF=64 causes the pointwise pass to override the corrected
+                # value back to 64, triggering an assertion in C-sim.
+                if layer_name == 'final_conv':
+                    config['LayerName'][layer_name]['ReuseFactor'] = 8
+                else:
+                    config['LayerName'][layer_name]['ReuseFactor'] = 64
                 config['LayerName'][layer_name]['Strategy'] = 'Resource'
         
         # Sigmoid: Keep the "Hardened" LUT to prevent C-Sim crashes/NaNs
