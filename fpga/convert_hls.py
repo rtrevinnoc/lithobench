@@ -88,8 +88,8 @@ def convert_pytorch(model, output_dir):
         granularity="name",
         backend="Vitis",
         default_precision="ap_fixed<16,6>", # Standard for HLS DL
-        channels_last_conversion='full', 
-        transpose_outputs=True,
+        channels_last_conversion='internal',
+        transpose_outputs=False,
         default_reuse_factor=128
     )
 
