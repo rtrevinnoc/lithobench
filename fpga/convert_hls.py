@@ -90,7 +90,7 @@ def convert_pytorch(model, output_dir):
         default_precision="ap_fixed<16,6>", # Standard for HLS DL
         channels_last_conversion='internal',
         transpose_outputs=False,
-        default_reuse_factor=64
+        default_reuse_factor=160
     )
 
     # 2. Global settings
@@ -103,13 +103,11 @@ def convert_pytorch(model, output_dir):
 
     for layer_name in list(config.get("LayerName", {}).keys()):
         if 'conv' in layer_name or 'up' in layer_name:
-                # final_conv is a small 1x1 pointwise conv (valid RFs: 1,2,4,8)
-                # Using RF=64 causes the pointwise pass to override the corrected
-                # value back to 64, triggering an assertion in C-sim.
+                # RF=64 was too aggressive — caused 1816 DSPs, overflowing pblock_CL.
+                # Use the default RF=128 for all conv/up layers except final_conv.
+                # final_conv is a 1x1 pointwise with only valid RFs: 1,2,4,8.
                 if layer_name == 'final_conv':
                     config['LayerName'][layer_name]['ReuseFactor'] = 8
-                else:
-                    config['LayerName'][layer_name]['ReuseFactor'] = 64
                 config['LayerName'][layer_name]['Strategy'] = 'Resource'
         
         # Sigmoid: Keep the "Hardened" LUT to prevent C-Sim crashes/NaNs
@@ -222,18 +220,19 @@ def validate_csim(model, hls_model, num_samples=10):
             print(f"DEBUG: Shape is {test_input_hls.shape}, expected (64, 64, 1)")
 
         test_input_hls = np.ascontiguousarray(test_input_hls)
-        
-        # Ensure it is contiguous in memory (C++ hates non-contiguous arrays)
-        test_input_hls = np.ascontiguousarray(test_input_hls)
 
-        # 4. HLS C-simulation
+        # 4. PyTorch reference output
+        with torch.no_grad():
+            pt_out = model(torch.from_numpy(test_input_pt)).numpy()
+
+        # 5. HLS C-simulation
         try:
             hls_out = hls_model.predict(test_input_hls)
         except Exception as e:
             print(f"HLS Predict failed: {e}")
             continue
 
-        # 5. Post-process HLS output to match PyTorch (if hls_out is H,W,C)
+        # 6. Post-process HLS output to match PyTorch (if hls_out is H,W,C)
         # hls4ml output is often flattened or (H, W, C)
         hls_out_reshaped = hls_out.reshape(pt_out.shape)
 

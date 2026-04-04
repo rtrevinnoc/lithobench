@@ -6,15 +6,15 @@
 // All port names taken directly from cl_ports.vh.
 //
 // HLS IP port list (from myproject.v):
-//   input  [1023:0] x_TDATA       — 64 × 16-bit samples per beat
-//   output [15:0]   layer42_out_TDATA — 1 sample per beat
+//   input  [15:0]   x_TDATA       — 1 × 16-bit sample per beat
+//   output [15:0]   layer40_out_TDATA — 1 sample per beat
 //   input           ap_clk, ap_rst_n (active-low)
 //   input/output    x_TVALID, x_TREADY
 //   input           ap_start; output ap_done, ap_ready, ap_idle
-//   input/output    layer42_out_TREADY, layer42_out_TVALID
+//   input/output    layer40_out_TREADY, layer40_out_TVALID
 //
 // PCIS address map:
-//   0x0000_0000 – 0x0000_1FFF : Input  BRAM (8 KB = 64 × 1024-bit words)
+//   0x0000_0000 – 0x0000_1FFF : Input  BRAM (8 KB = 4096 × 16-bit words)
 //   0x0000_2000 – 0x0000_3FFF : Output BRAM (8 KB = 4096 × 16-bit words)
 //
 // OCL register map (32-bit, byte offsets):
@@ -211,21 +211,21 @@ always_comb begin
 end
 
 // ============================================================================
-// Input BRAM — 1024-bit wide, 64 words deep
-//   Port A: PCIS write path  (two 512-bit beats → one 1024-bit word)
-//   Port B: FSM read path    (1024-bit → x_TDATA)
+// Input BRAM — 16-bit wide, 4096 words deep
+//   Port A: PCIS write path  (unpack 32 × 16-bit samples from each 512-bit beat)
+//   Port B: FSM read path    (16-bit → x_TDATA, 1 sample/beat)
 // ============================================================================
 
-logic [5:0]    ibram_addra, ibram_addrb;
-logic [1023:0] ibram_dina,  ibram_doutb;
-logic          ibram_ena,   ibram_enb,   ibram_wea;
+logic [11:0] ibram_addra, ibram_addrb;
+logic [15:0] ibram_dina,  ibram_doutb;
+logic        ibram_ena,   ibram_enb,   ibram_wea;
 
 xpm_memory_sdpram #(
-    .ADDR_WIDTH_A       (6),
-    .ADDR_WIDTH_B       (6),
-    .BYTE_WRITE_WIDTH_A (1024),
-    .WRITE_DATA_WIDTH_A (1024),
-    .READ_DATA_WIDTH_B  (1024),
+    .ADDR_WIDTH_A       (12),
+    .ADDR_WIDTH_B       (12),
+    .BYTE_WRITE_WIDTH_A (16),
+    .WRITE_DATA_WIDTH_A (16),
+    .READ_DATA_WIDTH_B  (16),
     .MEMORY_SIZE        (65536),
     .READ_LATENCY_B     (2),
     .MEMORY_PRIMITIVE   ("auto"),
@@ -245,7 +245,7 @@ xpm_memory_sdpram #(
 
 // ============================================================================
 // Output BRAM — 16-bit wide, 4096 words deep
-//   Port A: FSM write path   (layer42_out_TDATA, 1 sample/cycle)
+//   Port A: FSM write path   (layer40_out_TDATA, 1 sample/cycle)
 //   Port B: PCIS read path   (pack 32 samples → 512-bit beat)
 // ============================================================================
 
@@ -281,7 +281,7 @@ xpm_memory_sdpram #(
 // ============================================================================
 
 logic          hls_ap_start, hls_ap_done, hls_ap_idle, hls_ap_ready;
-logic [1023:0] hls_in_tdata;
+logic [15:0]   hls_in_tdata;
 logic          hls_in_tvalid, hls_in_tready;
 logic [15:0]   hls_out_tdata;
 logic          hls_out_tvalid, hls_out_tready;
@@ -364,20 +364,23 @@ end
 
 // ============================================================================
 // PCIS write path → Input BRAM
-// Two 512-bit beats fill one 1024-bit BRAM word.
+// Each 512-bit PCIS beat holds 32 × 16-bit samples.
+// One write burst of 128 beats fills all 4096 BRAM words.
 // ============================================================================
 
-logic         pcis_aw_valid_r;
-logic [511:0] pcis_beat_acc;
-logic         pcis_beat_half;
-logic [5:0]   pcis_wr_word;
+logic        pcis_aw_valid_r;
+logic [11:0] pcis_wr_base;      // BRAM word base for this AW beat (awaddr[12:1])
+logic [4:0]  pcis_sample_idx;   // 0..31 sample within the current 512-bit beat
+logic [511:0] pcis_wdata_latch;
+logic        pcis_unpacking;
 
 always_ff @(posedge clk_main_a0) begin
     if (!rst_main_n) begin
         pcis_aw_valid_r        <= 1'b0;
-        pcis_beat_acc          <= '0;
-        pcis_beat_half         <= 1'b0;
-        pcis_wr_word           <= '0;
+        pcis_wr_base           <= '0;
+        pcis_sample_idx        <= '0;
+        pcis_unpacking         <= 1'b0;
+        pcis_wdata_latch       <= '0;
         ibram_wea              <= 1'b0; ibram_ena <= 1'b0;
         cl_sh_dma_pcis_awready <= 1'b0;
         cl_sh_dma_pcis_wready  <= 1'b0;
@@ -388,23 +391,30 @@ always_ff @(posedge clk_main_a0) begin
         ibram_wea              <= 1'b0; ibram_ena <= 1'b0;
         cl_sh_dma_pcis_awready <= 1'b0;
 
+        // Latch AW address: awaddr[12:1] gives the first 16-bit word index
         if (sh_cl_dma_pcis_awvalid && !pcis_aw_valid_r) begin
             cl_sh_dma_pcis_awready <= 1'b1;
             pcis_aw_valid_r        <= 1'b1;
             cl_sh_dma_pcis_bid     <= sh_cl_dma_pcis_awid;
-            pcis_wr_word           <= sh_cl_dma_pcis_awaddr[12:7];
+            pcis_wr_base           <= sh_cl_dma_pcis_awaddr[12:1];
         end
 
-        cl_sh_dma_pcis_wready <= pcis_aw_valid_r && !ibram_wea;
-        if (sh_cl_dma_pcis_wvalid && pcis_aw_valid_r) begin
-            if (!pcis_beat_half) begin
-                pcis_beat_acc  <= sh_cl_dma_pcis_wdata;
-                pcis_beat_half <= 1'b1;
-            end else begin
-                ibram_ena      <= 1'b1; ibram_wea <= 1'b1;
-                ibram_addra    <= pcis_wr_word;
-                ibram_dina     <= {sh_cl_dma_pcis_wdata, pcis_beat_acc};
-                pcis_beat_half         <= 1'b0;
+        // Accept write data only when not in the middle of unpacking
+        cl_sh_dma_pcis_wready <= pcis_aw_valid_r && !pcis_unpacking;
+        if (sh_cl_dma_pcis_wvalid && pcis_aw_valid_r && !pcis_unpacking) begin
+            pcis_wdata_latch <= sh_cl_dma_pcis_wdata;
+            pcis_sample_idx  <= '0;
+            pcis_unpacking   <= 1'b1;
+        end
+
+        // Unpack 32 × 16-bit samples sequentially into BRAM
+        if (pcis_unpacking) begin
+            ibram_ena   <= 1'b1; ibram_wea <= 1'b1;
+            ibram_addra <= pcis_wr_base + {7'b0, pcis_sample_idx};
+            ibram_dina  <= pcis_wdata_latch[pcis_sample_idx * 16 +: 16];
+            pcis_sample_idx <= pcis_sample_idx + 1;
+            if (pcis_sample_idx == 5'd31) begin
+                pcis_unpacking         <= 1'b0;
                 pcis_aw_valid_r        <= 1'b0;
                 cl_sh_dma_pcis_bvalid  <= 1'b1;
                 cl_sh_dma_pcis_bresp   <= 2'b00;
@@ -500,10 +510,10 @@ typedef enum logic [2:0] {
     S_DONE       = 3'd4
 } fsm_state_t;
 
-localparam HLS_IN_BEATS = 64;
+localparam HLS_IN_BEATS = 4096;
 
 fsm_state_t  fsm_state;
-logic [5:0]  fsm_rd_ptr;
+logic [11:0] fsm_rd_ptr;
 logic [11:0] fsm_wr_ptr;
 logic [1:0]  fsm_lat_cnt;
 
@@ -553,7 +563,7 @@ always_ff @(posedge clk_main_a0) begin
                 end
                 if (hls_in_tvalid && hls_in_tready) begin
                     fsm_rd_ptr <= fsm_rd_ptr + 1;
-                    if (fsm_rd_ptr == 6'(HLS_IN_BEATS - 1)) begin
+                    if (fsm_rd_ptr == 12'(HLS_IN_BEATS - 1)) begin
                         hls_ap_start <= 1'b0;
                         fsm_state    <= S_WAIT_DONE;
                     end
@@ -599,9 +609,9 @@ myproject hls_ip (
     .x_TDATA             (hls_in_tdata),
     .x_TVALID            (hls_in_tvalid),
     .x_TREADY            (hls_in_tready),
-    .layer42_out_TDATA   (hls_out_tdata),
-    .layer42_out_TVALID  (hls_out_tvalid),
-    .layer42_out_TREADY  (hls_out_tready)
+    .layer40_out_TDATA   (hls_out_tdata),
+    .layer40_out_TVALID  (hls_out_tvalid),
+    .layer40_out_TREADY  (hls_out_tready)
 );
 
 endmodule // penumbra

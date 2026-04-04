@@ -14,3 +14,6 @@ saved/StdMetal_*/
 saved/StdContact_*/
 dev/
 .claude/
+hls4ml_mini_unet/
+saved/mini_unet/
+saved/mini_unit_original/
