@@ -184,6 +184,86 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Step 5b: Inject SLR1 Pblock into small_shell_cl_pnr_user.xdc
+#
+# Root cause of the 093045 timing violation (WNS = -2.3 ns):
+#   All 9 BRAM_18K (hls4ml FIFOs / shift-line buffers) land in SLR1, but
+#   Vivado freely places some CL registers in SLR0, producing ~5.3 ns
+#   inter-SLR routing paths (FDRE → RAMB36E2, 1 logic level, 98% routing).
+#   The fix is to confine the entire CL hierarchy to SLR1.
+# ---------------------------------------------------------------------------
+
+CONSTRAINTS_DIR="${CL_DIR}/build/constraints"
+PNR_XDC="${CONSTRAINTS_DIR}/small_shell_cl_pnr_user.xdc"
+
+if [ ! -f "${PNR_XDC}" ]; then
+    echo "ERROR: ${PNR_XDC} not found"
+    exit 1
+fi
+
+if grep -q "pblock_cl_slr1" "${PNR_XDC}"; then
+    echo "small_shell_cl_pnr_user.xdc already has SLR1 Pblock — skipping."
+else
+    echo "Injecting SLR1 Pblock into small_shell_cl_pnr_user.xdc..."
+    cat >> "${PNR_XDC}" << 'EOF'
+
+# ---- SLR1 Pblock for CL (added by f2_deploy.sh) ----
+# All hls4ml weight BRAMs synthesise into SLR1; confining every CL register
+# there eliminates inter-SLR data paths (root cause: WNS = -2.3 ns in run
+# 093045 where FDRE in SLR0 drove RAMB36E2 in SLR1 across ~5.3 ns of
+# SLL routing with only 1 LUT of logic).
+#
+# The AWS F2 small-shell instantiates the CL as WRAPPER/CL; fall back to
+# a top-level "CL" instance name if the hierarchy differs.
+create_pblock pblock_cl_slr1
+resize_pblock  [get_pblocks pblock_cl_slr1] -add {SLR1}
+if {[llength [get_cells -quiet WRAPPER/CL]] > 0} {
+    add_cells_to_pblock [get_pblocks pblock_cl_slr1] [get_cells WRAPPER/CL]
+} elseif {[llength [get_cells -quiet CL]] > 0} {
+    add_cells_to_pblock [get_pblocks pblock_cl_slr1] [get_cells CL]
+} else {
+    # Last resort: match any cell whose hierarchical name contains "hls_ip"
+    # (the instance name used in cl_top.sv for the myproject module).
+    add_cells_to_pblock [get_pblocks pblock_cl_slr1] \
+        [get_cells -hierarchical -filter {NAME =~ *hls_ip*}]
+}
+# NOTE: CONTAIN_ROUTING must NOT be set on this pblock.
+# Vivado's DFX DRC (HDPostRouteDRC-04) enforces routing containment strictly
+# and the global GND/VCC nets unavoidably route through boundary tiles,
+# causing route_design to fail.  SLR1 placement alone is sufficient to
+# eliminate the inter-SLR data paths that caused the original WNS violation.
+# ---- end SLR1 Pblock ----
+EOF
+    echo "  Patched ${PNR_XDC}"
+fi
+
+# ---------------------------------------------------------------------------
+# Step 5c: Inject false-path constraint for shell reset → hls4ml BRAM enables
+#
+# Root cause of WNS = -1.942 ns (post-RTL-fix belt-and-suspenders):
+#   The shell's PIPE_RST_OUT_N register may still drive BRAM ENARDEN pins
+#   through combinational reset-enable logic.  Reset assertion/deassertion is
+#   a slow, infrequent control event — it does not need single-cycle timing.
+# ---------------------------------------------------------------------------
+
+if grep -q "hls4ml_rst_false_path" "${PNR_XDC}"; then
+    echo "small_shell_cl_pnr_user.xdc already has reset false-path — skipping."
+else
+    echo "Injecting reset false-path into small_shell_cl_pnr_user.xdc..."
+    cat >> "${PNR_XDC}" << 'EOF'
+
+# ---- hls4ml reset false-path (added by f2_deploy.sh) hls4ml_rst_false_path ----
+# Shell PIPE_RST_OUT_N → hls4ml FIFO BRAM ENARDEN: reset is a slow control
+# event; exempting it from single-cycle timing is semantically safe.
+set_false_path \
+    -from [get_cells -quiet {WRAPPER/RL_SHIM/PIPE_RST_OUT_N/pipe_reg[*][*]}] \
+    -to   [get_pins  -hierarchical -filter {NAME =~ WRAPPER/CL/hls_ip/*/ENARDEN}]
+# ---- end hls4ml reset false-path ----
+EOF
+    echo "  Patched ${PNR_XDC}"
+fi
+
+# ---------------------------------------------------------------------------
 # Step 6: Verify HLS port names (reminder)
 # ---------------------------------------------------------------------------
 

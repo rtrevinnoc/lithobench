@@ -277,6 +277,21 @@ xpm_memory_sdpram #(
 );
 
 // ============================================================================
+// Reset pipeline
+//
+// The shell's PIPE_RST_OUT_N register lives in the shell's SLR.  Feeding
+// rst_main_n directly to the HLS IP creates a combinational path that crosses
+// the SLL boundary into SLR1 (where the pblock places the CL), causing
+// WNS = -1.942 ns on every BRAM ENARDEN pin in the hls4ml FIFOs.
+// One extra register stage inside the CL absorbs that SLR-crossing hop:
+// the new source register is placed in SLR1 by the pblock, so the remaining
+// path (register → ENARDEN combinational logic) stays within SLR1.
+// ============================================================================
+
+logic rst_main_n_r;
+always_ff @(posedge clk_main_a0) rst_main_n_r <= rst_main_n;
+
+// ============================================================================
 // HLS IP signals
 // ============================================================================
 
@@ -601,7 +616,7 @@ assign hls_out_tready = 1'b1;
 
 myproject hls_ip (
     .ap_clk              (clk_main_a0),
-    .ap_rst_n            (rst_main_n),
+    .ap_rst_n            (rst_main_n_r),
     .ap_start            (hls_ap_start),
     .ap_done             (hls_ap_done),
     .ap_idle             (hls_ap_idle),

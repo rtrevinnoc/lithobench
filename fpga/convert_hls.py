@@ -90,7 +90,7 @@ def convert_pytorch(model, output_dir):
         default_precision="ap_fixed<16,6>", # Standard for HLS DL
         channels_last_conversion='internal',
         transpose_outputs=False,
-        default_reuse_factor=160
+        default_reuse_factor=160,
     )
 
     # 2. Global settings
@@ -101,13 +101,33 @@ def convert_pytorch(model, output_dir):
     if "LayerName" not in config:
         config["LayerName"] = {}
 
+    # Timing fix: raise RF above each layer's NIn (kernel² × C_in) so hls4ml
+    # uses the rf_gt_nin variant (1 MAC/output) instead of rf_leq_nin
+    # (NIn/RF MACs/output).  rf_leq_nin at RF=160 produced fo≈20K ap_start_reg
+    # signals that couldn't be routed across the SLR [1→2] boundary in 4 ns:
+    #   deconv3.0: NIn=864 → 5 MACs/out × 32 out = 160 MACs (config23: 155 reps)
+    #   conv4.2:   NIn=576 → 4 MACs/out × 64 out = 256 MACs (config19:  39 reps)
+    # RF must strictly exceed NIn to get rf_gt_nin; round up to next power of two.
+    _HEAVY_RF = [
+        # Check deconv* before conv* — 'deconv3' contains 'conv' so order matters.
+        ('deconv3', 1024),  # max NIn = 96×9 = 864;  1024 > 864  → rf_gt_nin
+        ('deconv2',  512),  # max NIn = 48×9 = 432;   512 > 432  → rf_gt_nin
+        ('deconv1',  256),  # max NIn = 24×9 = 216;   256 > 216  → rf_gt_nin
+        ('conv4',   1024),  # max NIn = 64×9 = 576;  1024 > 576  → rf_gt_nin
+        ('conv3',    512),  # max NIn = 32×9 = 288;   512 > 288  → rf_gt_nin
+        # conv1/conv2 already rf_gt_nin at default 160 (max NIn ≤ 144).
+    ]
+
     for layer_name in list(config.get("LayerName", {}).keys()):
         if 'conv' in layer_name or 'up' in layer_name:
-                # RF=64 was too aggressive — caused 1816 DSPs, overflowing pblock_CL.
-                # Use the default RF=128 for all conv/up layers except final_conv.
-                # final_conv is a 1x1 pointwise with only valid RFs: 1,2,4,8.
+                # final_conv is a 1×1 pointwise; only valid RFs are 1,2,4,8.
                 if layer_name == 'final_conv':
                     config['LayerName'][layer_name]['ReuseFactor'] = 8
+                else:
+                    for prefix, rf in _HEAVY_RF:
+                        if layer_name.startswith(prefix):
+                            config['LayerName'][layer_name]['ReuseFactor'] = rf
+                            break
                 config['LayerName'][layer_name]['Strategy'] = 'Resource'
         
         # Sigmoid: Keep the "Hardened" LUT to prevent C-Sim crashes/NaNs
@@ -135,6 +155,7 @@ def convert_pytorch(model, output_dir):
         backend="Vitis",
         part=FPGA_PART,
         io_type='io_stream',
+        clock_period=CLOCK_PERIOD
     )
 
     _patch_tcl(output_dir)
@@ -196,6 +217,7 @@ def convert_onnx(model, output_dir):
         output_dir=output_dir,
         backend="Vitis",
         part=FPGA_PART,
+        clock_period=CLOCK_PERIOD
     )
     return hls_model
 
