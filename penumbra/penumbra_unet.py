@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 
-class MiniUNet(nn.Module):
+class PenumbraUNet(nn.Module):
     """
     Scaled-down UNet for FPGA deployment via hls4ml.
 

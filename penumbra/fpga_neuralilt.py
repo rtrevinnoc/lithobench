@@ -33,7 +33,7 @@ from torch.utils.data import DataLoader
 from pycommon.settings import REALTYPE, DEVICE
 import pylitho.exact as litho
 from lithobench.model import ModelILT
-from fpga.mini_unet import MiniUNet
+from fpga.penumbra import PenumbraUNet
 from fpga.tiled_inference import TiledInference
 
 
@@ -55,7 +55,7 @@ class FPGANeuralILT(ModelILT):
     def __init__(self, size=(512, 512), tile_size=64, overlap=16, use_fpga=False):
         super().__init__(size=size, name="FPGANeuralILT")
         self.simLitho = litho.LithoSim("./config/lithosimple.txt")
-        self.net = MiniUNet()
+        self.net = PenumbraUNet()
         if torch.cuda.is_available():
             self.net = self.net.cuda()
         self.tiler = TiledInference(

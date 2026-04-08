@@ -1,17 +1,13 @@
 """Convert trained MiniUNet to HLS firmware via hls4ml.
 
-Supports two conversion paths:
-  1. PyTorch frontend (default) — uses torch.fx tracing
-  2. ONNX fallback — exports to ONNX first, then converts via hls4ml ONNX frontend
+Supports conversion via PyTorch frontend (uses torch.fx tracing).
 
 Usage:
-    python3 fpga/convert_hls.py --weights saved/fpga/mini_unet_best.pth
-    python3 fpga/convert_hls.py --weights saved/fpga/mini_unet_best.pth --backend onnx
-    python3 fpga/convert_hls.py --weights saved/fpga/mini_unet_best.pth --synth
+    python3 fpga/convert_hls.py --weights saved/fpga/penumbra_unet_best.pth
+    python3 fpga/convert_hls.py --weights saved/fpga/penumbra_unet_best.pth --synth
 """
 
 import os
-import subprocess
 import sys
 sys.path.append(".")
 import argparse
@@ -19,7 +15,7 @@ import argparse
 import numpy as np
 import torch
 
-from fpga.mini_unet import MiniUNet, fuse_batchnorm
+from fpga.penumbra import PenumbraUNet, fuse_batchnorm
 
 
 # --------------------------------------------------------------------------- #
@@ -63,7 +59,7 @@ def _patch_tcl(output_dir: str) -> None:
 
 def load_and_fuse(weights_path):
     """Load MiniUNet weights and fuse BatchNorm into Conv2d."""
-    model = MiniUNet()
+    model = PenumbraUNet()
     state = torch.load(weights_path, map_location="cpu")
     model.load_state_dict(state)
     model.eval()
@@ -76,26 +72,25 @@ def load_and_fuse(weights_path):
 def convert_pytorch(model, output_dir):
     """Convert MiniUNet via hls4ml's PyTorch frontend."""
     import hls4ml
-    import torch
 
     model.eval()
     model.cpu()
 
-    # 1. Use 16-bit as the base for the entire model
+    # 1. Use global config variables as the base for the entire model
     config = hls4ml.utils.config_from_pytorch_model(
         model,
         input_shape=INPUT_SHAPE, 
         granularity="name",
         backend="Vitis",
-        default_precision="ap_fixed<16,6>", # Standard for HLS DL
+        default_precision=DEFAULT_PRECISION,
         channels_last_conversion='internal',
         transpose_outputs=False,
-        default_reuse_factor=160,
+        default_reuse_factor=DEFAULT_REUSE_FACTOR,
     )
 
     # 2. Global settings
-    config["Model"]["IOType"] = "io_stream" 
-    config['Model']['Strategy'] = 'Resource' # Necessary for large U-Nets
+    config["Model"]["IOType"] = IO_TYPE 
+    config['Model']['Strategy'] = STRATEGY
 
     # 3. Patch the Layer Config
     if "LayerName" not in config:
@@ -103,36 +98,29 @@ def convert_pytorch(model, output_dir):
 
     # Timing fix: raise RF above each layer's NIn (kernel² × C_in) so hls4ml
     # uses the rf_gt_nin variant (1 MAC/output) instead of rf_leq_nin
-    # (NIn/RF MACs/output).  rf_leq_nin at RF=160 produced fo≈20K ap_start_reg
-    # signals that couldn't be routed across the SLR [1→2] boundary in 4 ns:
-    #   deconv3.0: NIn=864 → 5 MACs/out × 32 out = 160 MACs (config23: 155 reps)
-    #   conv4.2:   NIn=576 → 4 MACs/out × 64 out = 256 MACs (config19:  39 reps)
-    # RF must strictly exceed NIn to get rf_gt_nin; round up to next power of two.
     _HEAVY_RF = [
-        # Check deconv* before conv* — 'deconv3' contains 'conv' so order matters.
         ('deconv3', 1024),  # max NIn = 96×9 = 864;  1024 > 864  → rf_gt_nin
         ('deconv2',  512),  # max NIn = 48×9 = 432;   512 > 432  → rf_gt_nin
         ('deconv1',  256),  # max NIn = 24×9 = 216;   256 > 216  → rf_gt_nin
         ('conv4',   1024),  # max NIn = 64×9 = 576;  1024 > 576  → rf_gt_nin
         ('conv3',    512),  # max NIn = 32×9 = 288;   512 > 288  → rf_gt_nin
-        # conv1/conv2 already rf_gt_nin at default 160 (max NIn ≤ 144).
     ]
 
     for layer_name in list(config.get("LayerName", {}).keys()):
         if 'conv' in layer_name or 'up' in layer_name:
-                # final_conv is a 1×1 pointwise; only valid RFs are 1,2,4,8.
-                if layer_name == 'final_conv':
-                    config['LayerName'][layer_name]['ReuseFactor'] = 8
-                else:
-                    for prefix, rf in _HEAVY_RF:
-                        if layer_name.startswith(prefix):
-                            config['LayerName'][layer_name]['ReuseFactor'] = rf
-                            break
-                config['LayerName'][layer_name]['Strategy'] = 'Resource'
+            if layer_name == 'final_conv':
+                # final_conv is a 1×1 pointwise; valid RFs are 1,2,4,8. Using BOTTLENECK if valid, else 8
+                config['LayerName'][layer_name]['ReuseFactor'] = min(8, BOTTLENECK_REUSE_FACTOR) 
+            else:
+                for prefix, rf in _HEAVY_RF:
+                    if layer_name.startswith(prefix):
+                        config['LayerName'][layer_name]['ReuseFactor'] = rf
+                        break
+            config['LayerName'][layer_name]['Strategy'] = STRATEGY
         
         # Sigmoid: Keep the "Hardened" LUT to prevent C-Sim crashes/NaNs
         if 'sigmoid' in layer_name.lower():
-            config['LayerName'][layer_name]['Precision'] = 'ap_fixed<16,6>'
+            config['LayerName'][layer_name]['Precision'] = DEFAULT_PRECISION
             config['LayerName'][layer_name]['table_size'] = 2048
             # Wider table_t allows the LUT to handle larger activation swings
             config['LayerName'][layer_name]['table_t'] = 'ap_fixed<18,8>'
@@ -140,11 +128,11 @@ def convert_pytorch(model, output_dir):
     # 4. Critical: Downsize the LayerType defaults
     # This ensures skip-connections and resizes don't waste 32-bit registers
     config['LayerType'] = {
-        'Conv2D': {'Precision': 'ap_fixed<16,6>'},
-        'Activation': {'Precision': 'ap_fixed<16,6>'},
-        'Concatenate': {'Precision': 'ap_fixed<16,6>'},
-        'Resize': {'Precision': 'ap_fixed<16,6>'},
-        'Merge': {'Precision': 'ap_fixed<16,6>'}
+        'Conv2D': {'Precision': DEFAULT_PRECISION},
+        'Activation': {'Precision': DEFAULT_PRECISION},
+        'Concatenate': {'Precision': DEFAULT_PRECISION},
+        'Resize': {'Precision': DEFAULT_PRECISION},
+        'Merge': {'Precision': DEFAULT_PRECISION}
     }
 
     hls_model = hls4ml.converters.convert_from_pytorch_model(
@@ -154,71 +142,11 @@ def convert_pytorch(model, output_dir):
         output_dir=output_dir,
         backend="Vitis",
         part=FPGA_PART,
-        io_type='io_stream',
+        io_type=IO_TYPE,
         clock_period=CLOCK_PERIOD
     )
 
     _patch_tcl(output_dir)
-    return hls_model
-
-
-def convert_onnx(model, output_dir):
-    import hls4ml
-    import onnx as _onnx
-    import torch.onnx
-
-    onnx_path = os.path.join(output_dir, "mini_unet.onnx")
-    cl_onnx_path = os.path.join(output_dir, "mini_unet_cl.onnx")
-    os.makedirs(output_dir, exist_ok=True)
-
-    # 1. FORCE LEGACY EXPORT (Fixes the Opset 18 / kernel_shape error)
-    dummy_input = torch.randn(1, 1, 64, 64) # Ensure NCHW for export
-    torch.onnx.export(
-        model, 
-        dummy_input, 
-        onnx_path,
-        input_names=["input"], 
-        output_names=["output"],
-        opset_version=11, # Crucial for qonnx
-        do_constant_folding=True,
-        # Use the legacy exporter type to avoid "Dynamo" overhead
-        operator_export_type=torch.onnx.OperatorExportTypes.ONNX
-    )
-
-    # 2. CHANNELS LAST CONVERSION
-    # We must run this, or hls4ml will refuse the ONNX model
-    try:
-        subprocess.run(["qonnx-cleanup", onnx_path, "--out-file", onnx_path], check=True)
-        subprocess.run(["qonnx-to-channels-last", "--make-input-channels-last", 
-                        f"--out-file={cl_onnx_path}", onnx_path], check=True)
-    except subprocess.CalledProcessError:
-        print("CRITICAL: qonnx failed. Your model likely has incompatible reshapes/squeezes.")
-        raise
-
-    # 3. CONFIGURE HLS4ML
-    model_proto = _onnx.load(cl_onnx_path)
-    config = hls4ml.utils.config_from_onnx_model(
-        model_proto,
-        default_precision='ap_fixed<16,6>',
-        backend="Vitis"
-    )
-
-    # BYPASS THE CRASHING OPTIMIZER
-    config['SkipOptimizers'] = ['transpose_optimizer']
-    config["Model"]["IOType"] = "io_stream"
-    
-    # Catch-all for precision errors
-    if "LayerType" not in config: config["LayerType"] = {}
-    config["LayerType"]["Precision"] = 'ap_fixed<16,6>'
-
-    hls_model = hls4ml.converters.convert_from_onnx_model(
-        model_proto,
-        hls_config=config,
-        output_dir=output_dir,
-        backend="Vitis",
-        part=FPGA_PART,
-        clock_period=CLOCK_PERIOD
-    )
     return hls_model
 
 
@@ -228,18 +156,19 @@ def validate_csim(model, hls_model, num_samples=10):
 
     for i in range(num_samples):
         # 1. Create the input (Batch, Channel, Height, Width)
-        test_input_pt = np.random.rand(1, 1, 64, 64).astype(np.float32)
+        test_input_pt = np.random.rand(*INPUT_SHAPE).astype(np.float32)
 
         # 2. Prepare for HLS
         # Instead of np.squeeze(test_input_pt), remove ONLY the first dimension:
-        test_input_hls = test_input_pt[0]  # Result: (1, 64, 64)
+        test_input_hls = test_input_pt[0]  # Result: (Channels, Height, Width)
 
-        # 3. Now transpose to (64, 64, 1)
+        # 3. Now transpose to (Height, Width, Channels)
         test_input_hls = np.transpose(test_input_hls, (1, 2, 0)) 
 
         # 4. Final safety check (optional but helpful for debugging)
-        if test_input_hls.shape != (64, 64, 1):
-            print(f"DEBUG: Shape is {test_input_hls.shape}, expected (64, 64, 1)")
+        expected_shape = (INPUT_SHAPE[2], INPUT_SHAPE[3], INPUT_SHAPE[1])
+        if test_input_hls.shape != expected_shape:
+            print(f"DEBUG: Shape is {test_input_hls.shape}, expected {expected_shape}")
 
         test_input_hls = np.ascontiguousarray(test_input_hls)
 
@@ -255,7 +184,6 @@ def validate_csim(model, hls_model, num_samples=10):
             continue
 
         # 6. Post-process HLS output to match PyTorch (if hls_out is H,W,C)
-        # hls4ml output is often flattened or (H, W, C)
         hls_out_reshaped = hls_out.reshape(pt_out.shape)
 
         diff = np.max(np.abs(pt_out - hls_out_reshaped))
@@ -281,8 +209,6 @@ def main():
                         help="Path to trained MiniUNet weights (.pth)")
     parser.add_argument("--output_dir", "-o", default="hls4ml_mini_unet", type=str,
                         help="Output directory for generated HLS project")
-    parser.add_argument("--backend", default="pytorch", choices=["pytorch", "onnx"],
-                        help="Conversion backend: pytorch (default) or onnx (fallback)")
     parser.add_argument("--synth", action="store_true",
                         help="Run Vitis HLS synthesis after conversion")
     parser.add_argument("--cosim", action="store_true",
@@ -294,19 +220,8 @@ def main():
     print(f"Loading and fusing model from {args.weights}")
     model = load_and_fuse(args.weights)
 
-    print(f"\nConverting via {args.backend} backend...")
-    try:
-        if args.backend == "pytorch":
-            hls_model = convert_pytorch(model, args.output_dir)
-        else:
-            hls_model = convert_onnx(model, args.output_dir)
-    except Exception as e:
-        if args.backend == "pytorch":
-            print(f"\nPyTorch frontend failed: {e}")
-            print("Falling back to ONNX frontend...")
-            hls_model = convert_onnx(model, args.output_dir)
-        else:
-            raise
+    print("\nConverting via PyTorch frontend...")
+    hls_model = convert_pytorch(model, args.output_dir)
 
     print("\nCompiling HLS model...")
     hls_model.compile()

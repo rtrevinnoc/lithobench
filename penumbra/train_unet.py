@@ -32,7 +32,7 @@ from pycommon.settings import REALTYPE, DEVICE
 from lithobench.dataset import loadersILT
 from lithobench.ilt.neuralilt import UNet
 import pylitho.exact as litho
-from fpga.mini_unet import MiniUNet
+from fpga.penumbra_unet import PenumbraUNet
 from fpga.tiled_inference import TiledInference
 
 
@@ -287,7 +287,7 @@ def main():
     )
 
     # Create student
-    student = MiniUNet().to(device)
+    student = PenumbraUNet().to(device)
     num_params = sum(p.numel() for p in student.parameters())
     print(f"MiniUNet parameters: {num_params:,}")
 
