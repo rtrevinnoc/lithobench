@@ -1,5 +1,5 @@
 // ============================================================================
-// cl_top.sv — AWS F2 CL for MiniUNet HLS IP
+// cl_top.sv — AWS F2 CL for PenumbraUNet HLS IP
 //
 // Based on CL_TEMPLATE.sv + verified against cl_ports.vh.
 // Module name must match --cl argument: penumbra.

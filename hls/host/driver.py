@@ -1,4 +1,4 @@
-"""FPGA driver for MiniUNet HLS IP on AWS F2 (VU47P).
+"""FPGA driver for PenumbraUNet HLS IP on AWS F2 (VU47P).
 
 Communicates with the CL via:
   - /dev/xdma0_h2c_0  : host-to-card DMA (writing input tiles)
@@ -62,7 +62,7 @@ BAR0_MMAP_SIZE = 4096  # one page
 
 
 class FPGADriver:
-    """Low-level FPGA driver for MiniUNet tile inference on AWS F2.
+    """Low-level FPGA driver for PenumbraUNet tile inference on AWS F2.
 
     Usage::
 
@@ -194,7 +194,7 @@ class FPGADriver:
     # ------------------------------------------------------------------
 
     def process_tile(self, tile_f32):
-        """Process one 64x64 tile through the FPGA MiniUNet.
+        """Process one 64x64 tile through the FPGA PenumbraUNet.
 
         Args:
             tile_f32: numpy float32 array, shape broadcastable to (64, 64).

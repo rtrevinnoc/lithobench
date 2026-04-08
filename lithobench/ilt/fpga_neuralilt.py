@@ -3,12 +3,8 @@
 Follows the ModelILT interface from lithobench/model.py so it can be used
 with the existing training and evaluation infrastructure.
 
-Usage with lithobench/train.py:
-    python3 lithobench/train.py -m fpga/fpga_neuralilt.py -a FPGANeuralILT \
-        -i 512 -t ILT -s MetalSet -n 16 -b 32
-
 Standalone:
-    from fpga.fpga_neuralilt import FPGANeuralILT
+    from lithobench.ilt.fpga_neuralilt import FPGANeuralILT
     model = FPGANeuralILT()
     model.load("saved/fpga/mini_unet_best.pth")
     mask = model.run(target_512x512)
@@ -33,8 +29,197 @@ from torch.utils.data import DataLoader
 from pycommon.settings import REALTYPE, DEVICE
 import pylitho.exact as litho
 from lithobench.model import ModelILT
-from fpga.penumbra import PenumbraUNet
-from fpga.tiled_inference import TiledInference
+
+
+class TiledInference:
+    """Manages tiled inference of PenumbraUNet over a full-size image.
+
+    The 512x512 input is reflection-padded, split into overlapping 64x64 tiles
+    (stride 32), and reassembled after inference by keeping only the central
+    32x32 crop of each tile output.
+
+    Args:
+        tile_size: Size of each square tile (default 64).
+        overlap: Overlap in pixels on each side (default 16).
+        image_size: Full input image size (default 512).
+    """
+
+    def __init__(self, tile_size=64, overlap=16, image_size=512):
+        self.tile_size = tile_size
+        self.overlap = overlap
+        self.stride = tile_size - 2 * overlap  # 32
+        self.image_size = image_size
+
+    @property
+    def num_tiles_per_side(self):
+        return self.image_size // self.stride
+
+    def extract_tiles(self, image):
+        padded = F.pad(image, [self.overlap] * 4, mode="reflect")
+        tiles, positions = [], []
+        n = self.num_tiles_per_side
+        for i in range(n):
+            for j in range(n):
+                r, c = i * self.stride, j * self.stride
+                tiles.append(padded[:, :, r:r + self.tile_size, c:c + self.tile_size])
+                positions.append((i, j))
+        return torch.cat(tiles, dim=0), positions
+
+    def reassemble(self, tile_outputs, positions):
+        n = self.num_tiles_per_side
+        crops = tile_outputs[
+            :, :,
+            self.overlap:self.tile_size - self.overlap,
+            self.overlap:self.tile_size - self.overlap,
+        ]
+        crops = crops.reshape(n, n, 1, self.stride, self.stride)
+        crops = crops.permute(2, 0, 3, 1, 4).contiguous()
+        return crops.reshape(1, 1, n * self.stride, n * self.stride)
+
+    def forward(self, image, model, batch_size=64):
+        """Differentiable tiled forward pass (keeps gradients for training)."""
+        tiles, positions = self.extract_tiles(image)
+        outputs = [model(tiles[s:s + batch_size]) for s in range(0, tiles.shape[0], batch_size)]
+        return self.reassemble(torch.cat(outputs, dim=0), positions)
+
+    def run(self, image, model, batch_size=64, device=None):
+        """Non-differentiable tiled inference (no gradients, for deployment)."""
+        if device is None:
+            device = image.device
+        tiles, positions = self.extract_tiles(image)
+        outputs = []
+        for s in range(0, tiles.shape[0], batch_size):
+            with torch.no_grad():
+                outputs.append(model(tiles[s:s + batch_size].to(device)).cpu())
+        return self.reassemble(torch.cat(outputs, dim=0), positions)
+
+
+class PenumbraUNet(nn.Module):
+    """
+    Scaled-down UNet for FPGA deployment via hls4ml.
+
+    Architecture mirrors the original NeuralILT UNet but with reduced channel
+    widths for on-chip FPGA resource constraints.
+
+    Original: 1 -> 64 -> 128 -> 256 -> 512  (~7.8M params)
+    This:     1 ->  8 ->  16 ->  32 ->  64  (~122K params)
+
+    Uses nn.Upsample(mode='nearest') for upsampling — exports to ONNX Resize
+    which hls4ml supports — and explicit nn.Sequential blocks for torch.fx tracing.
+
+    Input:  (B, 1, 64, 64)  — single-channel tile
+    Output: (B, 1, 64, 64)  — predicted mask tile
+    """
+
+    def __init__(self):
+        super().__init__()
+        # Encoder
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(1, 8, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.BatchNorm2d(8), nn.ReLU(),
+            nn.Conv2d(8, 8, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.BatchNorm2d(8), nn.ReLU(),
+        )
+        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(8, 16, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.BatchNorm2d(16), nn.ReLU(),
+            nn.Conv2d(16, 16, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.BatchNorm2d(16), nn.ReLU(),
+        )
+        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.BatchNorm2d(32), nn.ReLU(),
+            nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.BatchNorm2d(32), nn.ReLU(),
+        )
+        self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2)
+        # Bottleneck
+        self.conv4 = nn.Sequential(
+            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.BatchNorm2d(64), nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.BatchNorm2d(64), nn.ReLU(),
+        )
+        # Decoder
+        self.up3 = nn.Upsample(scale_factor=2, mode='nearest')
+        self.deconv3 = nn.Sequential(
+            nn.Conv2d(64 + 32, 32, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.BatchNorm2d(32), nn.ReLU(),
+            nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.BatchNorm2d(32), nn.ReLU(),
+        )
+        self.up2 = nn.Upsample(scale_factor=2, mode='nearest')
+        self.deconv2 = nn.Sequential(
+            nn.Conv2d(32 + 16, 16, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.BatchNorm2d(16), nn.ReLU(),
+            nn.Conv2d(16, 16, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.BatchNorm2d(16), nn.ReLU(),
+        )
+        self.up1 = nn.Upsample(scale_factor=2, mode='nearest')
+        self.deconv1 = nn.Sequential(
+            nn.Conv2d(16 + 8, 8, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.BatchNorm2d(8), nn.ReLU(),
+            nn.Conv2d(8, 8, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.BatchNorm2d(8), nn.ReLU(),
+        )
+        self.final_conv = nn.Conv2d(8, 1, kernel_size=1, stride=1, padding=0, bias=True)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        c1 = self.conv1(x)
+        x = self.pool1(c1)
+        c2 = self.conv2(x)
+        x = self.pool2(c2)
+        c3 = self.conv3(x)
+        x = self.pool3(c3)
+        x = self.conv4(x)
+        x = self.deconv3(torch.cat([self.up3(x), c3], dim=1))
+        x = self.deconv2(torch.cat([self.up2(x), c2], dim=1))
+        x = self.deconv1(torch.cat([self.up1(x), c1], dim=1))
+        return self.sigmoid(self.final_conv(x))
+
+
+def fuse_batchnorm(model):
+    """Fuse BatchNorm into preceding Conv2d for hls4ml export.
+
+    Returns a new model with BN folded into conv weights/biases.
+    """
+    import copy
+    fused = copy.deepcopy(model)
+    fused.eval()
+    for attr_name, module in list(fused.named_children()):
+        if not isinstance(module, nn.Sequential):
+            continue
+        layers = list(module.children())
+        new_layers = []
+        i = 0
+        while i < len(layers):
+            if (i + 1 < len(layers)
+                    and isinstance(layers[i], nn.Conv2d)
+                    and isinstance(layers[i + 1], nn.BatchNorm2d)):
+                new_layers.append(_fuse_conv_bn(layers[i], layers[i + 1]))
+                i += 2
+            else:
+                new_layers.append(layers[i])
+                i += 1
+        setattr(fused, attr_name, nn.Sequential(*new_layers))
+    return fused
+
+
+def _fuse_conv_bn(conv, bn):
+    with torch.no_grad():
+        scale = bn.weight / torch.sqrt(bn.running_var + bn.eps)
+        fused_weight = conv.weight * scale.reshape(-1, 1, 1, 1)
+        fused_bias = (conv.bias - bn.running_mean if conv.bias is not None
+                      else -bn.running_mean) * scale + bn.bias
+        fused = nn.Conv2d(conv.in_channels, conv.out_channels, conv.kernel_size,
+                          stride=conv.stride, padding=conv.padding,
+                          dilation=conv.dilation, groups=conv.groups, bias=True)
+        fused.weight.copy_(fused_weight)
+        fused.bias.copy_(fused_bias)
+    return fused
 
 
 class FPGANeuralILT(ModelILT):
@@ -42,7 +227,7 @@ class FPGANeuralILT(ModelILT):
 
     In CPU/GPU mode (use_fpga=False), this runs the MiniUNet with tiled
     inference entirely in PyTorch. With use_fpga=True, each tile is sent
-    to the F2 FPGA via XDMA DMA — see fpga/host/driver.py.
+    to the F2 FPGA via XDMA DMA — see hls/host/driver.py.
 
     Args:
         size: Full image size (default 512x512, matching NeuralILT).
@@ -69,7 +254,7 @@ class FPGANeuralILT(ModelILT):
     def _init_fpga(self):
         """Open the FPGA XDMA driver; fall back to PyTorch on failure."""
         try:
-            from fpga.host.driver import FPGADriver
+            from hls.host.driver import FPGADriver
             self._fpga_driver = FPGADriver()
             self._fpga_driver.open()
             print("[FPGANeuralILT] FPGA hardware mode enabled.")
@@ -86,17 +271,46 @@ class FPGANeuralILT(ModelILT):
             except Exception:
                 pass
 
+    def _load_teacher(self):
+        """Load a NeuralILT UNet teacher for knowledge distillation.
+
+        Reads the teacher weights path from the PENUMBRA_TEACHER environment
+        variable. Returns None if the variable is unset or the file is missing,
+        in which case pretrain() falls back to plain supervised training.
+
+        Usage::
+
+            PENUMBRA_TEACHER=saved/MetalSet_NeuralILT/net.pth \\
+                python3 lithobench/train.py -m lithobench/ilt/fpga_neuralilt.py ...
+        """
+        teacher_path = os.environ.get("PENUMBRA_TEACHER", "")
+        if not teacher_path or not os.path.exists(teacher_path):
+            return None
+        from lithobench.ilt.neuralilt import UNet
+        teacher = UNet()
+        state = torch.load(teacher_path, map_location="cpu")
+        teacher.load_state_dict(state)
+        device = next(self.net.parameters()).device
+        teacher = teacher.to(device)
+        teacher.eval()
+        for p in teacher.parameters():
+            p.requires_grad = False
+        print(f"[FPGANeuralILT] Loaded distillation teacher from {teacher_path}")
+        return teacher
+
     def pretrain(self, train_loader, val_loader, epochs=1, batch_size=4,
                  checkpoint_dir=None, resume_checkpoint=None):
-        """Supervised pretraining on full-size images using tiled crops.
+        """Pretraining on full-size images using tiled crops.
 
-        For each full-size (target, mask) pair, random tile crops are extracted
-        and the MiniUNet is trained with MSE loss.
+        If PENUMBRA_TEACHER is set to a NeuralILT weights path, uses knowledge
+        distillation (alpha-weighted teacher + GT loss, alpha decays over epochs).
+        Otherwise falls back to plain supervised MSE on tile crops.
 
         Args:
             checkpoint_dir: If set, save checkpoint_latest.pth here after each epoch.
             resume_checkpoint: Path to a checkpoint to resume from.
         """
+        teacher = self._load_teacher()
         opt = optim.Adam(self.net.parameters(), lr=1e-3)
         sched = lr_sched.StepLR(opt, 1, gamma=0.1)
         tile_size = self.tiler.tile_size
@@ -120,10 +334,16 @@ class FPGANeuralILT(ModelILT):
                     target = target.cuda()
                     label = label.cuda()
 
-                # Extract random tile crops from the batch
                 tiles_t, tiles_l = self._random_crops(target, label, tile_size, n=8)
                 mask = self.net(tiles_t)
-                loss = F.mse_loss(mask, tiles_l)
+
+                if teacher is not None:
+                    alpha = 0.7 * (1.0 - epoch / epochs)
+                    with torch.no_grad():
+                        teacher_out = teacher(tiles_t)
+                    loss = alpha * F.mse_loss(mask, teacher_out) + (1 - alpha) * F.mse_loss(mask, tiles_l)
+                else:
+                    loss = F.mse_loss(mask, tiles_l)
 
                 opt.zero_grad()
                 loss.backward()

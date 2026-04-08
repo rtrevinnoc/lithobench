@@ -1,10 +1,10 @@
-"""Convert trained MiniUNet to HLS firmware via hls4ml.
+"""Convert trained PenumbraUNet to HLS firmware via hls4ml.
 
 Supports conversion via PyTorch frontend (uses torch.fx tracing).
 
 Usage:
-    python3 fpga/convert_hls.py --weights saved/fpga/penumbra_unet_best.pth
-    python3 fpga/convert_hls.py --weights saved/fpga/penumbra_unet_best.pth --synth
+    python3 hls/convert_hls.py --weights saved/fpga/penumbra_unet_best.pth
+    python3 hls/convert_hls.py --weights saved/fpga/penumbra_unet_best.pth --synth
 """
 
 import os
@@ -15,7 +15,7 @@ import argparse
 import numpy as np
 import torch
 
-from fpga.penumbra import PenumbraUNet, fuse_batchnorm
+from lithobench.ilt.fpga_neuralilt import PenumbraUNet, fuse_batchnorm
 
 
 # --------------------------------------------------------------------------- #
@@ -58,7 +58,7 @@ def _patch_tcl(output_dir: str) -> None:
 
 
 def load_and_fuse(weights_path):
-    """Load MiniUNet weights and fuse BatchNorm into Conv2d."""
+    """Load PenumbraUNet weights and fuse BatchNorm into Conv2d."""
     model = PenumbraUNet()
     state = torch.load(weights_path, map_location="cpu")
     model.load_state_dict(state)
@@ -70,7 +70,7 @@ def load_and_fuse(weights_path):
 
 
 def convert_pytorch(model, output_dir):
-    """Convert MiniUNet via hls4ml's PyTorch frontend."""
+    """Convert PenumbraUNet via hls4ml's PyTorch frontend."""
     import hls4ml
 
     model.eval()
@@ -79,7 +79,7 @@ def convert_pytorch(model, output_dir):
     # 1. Use global config variables as the base for the entire model
     config = hls4ml.utils.config_from_pytorch_model(
         model,
-        input_shape=INPUT_SHAPE, 
+        input_shape=INPUT_SHAPE,
         granularity="name",
         backend="Vitis",
         default_precision=DEFAULT_PRECISION,
@@ -89,7 +89,7 @@ def convert_pytorch(model, output_dir):
     )
 
     # 2. Global settings
-    config["Model"]["IOType"] = IO_TYPE 
+    config["Model"]["IOType"] = IO_TYPE
     config['Model']['Strategy'] = STRATEGY
 
     # 3. Patch the Layer Config
@@ -110,14 +110,14 @@ def convert_pytorch(model, output_dir):
         if 'conv' in layer_name or 'up' in layer_name:
             if layer_name == 'final_conv':
                 # final_conv is a 1×1 pointwise; valid RFs are 1,2,4,8. Using BOTTLENECK if valid, else 8
-                config['LayerName'][layer_name]['ReuseFactor'] = min(8, BOTTLENECK_REUSE_FACTOR) 
+                config['LayerName'][layer_name]['ReuseFactor'] = min(8, BOTTLENECK_REUSE_FACTOR)
             else:
                 for prefix, rf in _HEAVY_RF:
                     if layer_name.startswith(prefix):
                         config['LayerName'][layer_name]['ReuseFactor'] = rf
                         break
             config['LayerName'][layer_name]['Strategy'] = STRATEGY
-        
+
         # Sigmoid: Keep the "Hardened" LUT to prevent C-Sim crashes/NaNs
         if 'sigmoid' in layer_name.lower():
             config['LayerName'][layer_name]['Precision'] = DEFAULT_PRECISION
@@ -163,7 +163,7 @@ def validate_csim(model, hls_model, num_samples=10):
         test_input_hls = test_input_pt[0]  # Result: (Channels, Height, Width)
 
         # 3. Now transpose to (Height, Width, Channels)
-        test_input_hls = np.transpose(test_input_hls, (1, 2, 0)) 
+        test_input_hls = np.transpose(test_input_hls, (1, 2, 0))
 
         # 4. Final safety check (optional but helpful for debugging)
         expected_shape = (INPUT_SHAPE[2], INPUT_SHAPE[3], INPUT_SHAPE[1])
@@ -204,10 +204,10 @@ def validate_csim(model, hls_model, num_samples=10):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Convert MiniUNet to HLS via hls4ml")
+    parser = argparse.ArgumentParser(description="Convert PenumbraUNet to HLS via hls4ml")
     parser.add_argument("--weights", "-w", required=True, type=str,
-                        help="Path to trained MiniUNet weights (.pth)")
-    parser.add_argument("--output_dir", "-o", default="hls4ml_mini_unet", type=str,
+                        help="Path to trained PenumbraUNet weights (.pth)")
+    parser.add_argument("--output_dir", "-o", default="hls4ml_penumbra_unet", type=str,
                         help="Output directory for generated HLS project")
     parser.add_argument("--synth", action="store_true",
                         help="Run Vitis HLS synthesis after conversion")
@@ -244,8 +244,8 @@ def main():
     print(f"\nHLS project generated at: {args.output_dir}")
     print("Next steps:")
     print(f"  1. Review the generated code in {args.output_dir}/")
-    print(f"  2. Run synthesis: python3 fpga/convert_hls.py --weights {args.weights} --synth")
-    print(f"  3. Integrate IP into F2 shell: bash fpga/f2_deploy.sh {args.output_dir}")
+    print(f"  2. Run synthesis: python3 hls/convert_hls.py --weights {args.weights} --synth")
+    print(f"  3. Integrate IP into F2 shell: bash hls/f2_deploy.sh {args.output_dir}")
 
 
 if __name__ == "__main__":

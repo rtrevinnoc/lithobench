@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# F2 FPGA Deployment Script for MiniUNet HLS IP
+# F2 FPGA Deployment Script for PenumbraUNet HLS IP
 #
 # Integrates the hls4ml-generated Vitis HLS IP into the existing "penumbra"
 # CL project (created via create_new_cl.py) and builds a Design Checkpoint
@@ -15,13 +15,13 @@
 #       cd $AWS_FPGA_REPO_DIR/hdk/cl/examples
 #       ./create_new_cl.py --new_cl_name penumbra
 #   - hls4ml project already synthesized:
-#       python3 fpga/convert_hls.py --weights saved/fpga/mini_unet_best.pth --synth
+#       python3 hls/convert_hls.py --weights saved/fpga/penumbra_unet_best.pth --synth
 #
 # Usage:
-#   bash fpga/f2_deploy.sh <hls4ml_output_dir>
+#   bash hls/f2_deploy.sh <hls4ml_output_dir>
 #
 # Example:
-#   bash fpga/f2_deploy.sh hls4ml_mini_unet
+#   bash hls/f2_deploy.sh hls4ml_penumbra_unet
 # ============================================================================
 
 set -euo pipefail
@@ -41,7 +41,7 @@ if [ -z "${CL_DIR:-}" ]; then
     export CL_DIR="${HDK_DIR}/cl/examples/penumbra"
 fi
 
-echo "=== F2 Penumbra (MiniUNet) Deployment ==="
+echo "=== F2 Penumbra (PenumbraUNet) Deployment ==="
 echo "HLS source:  ${HLS_DIR}"
 echo "CL project:  ${CL_DIR}"
 echo "HDK:         ${HDK_DIR}"
@@ -65,7 +65,7 @@ if [ ! -d "${HLS_RTL_DIR}" ] && [ ! -f "${HLS_EXPORT}" ]; then
     echo "  ${HLS_EXPORT}"
     echo ""
     echo "Run synthesis first:"
-    echo "  python3 fpga/convert_hls.py --weights saved/fpga/mini_unet_best.pth --synth"
+    echo "  python3 hls/convert_hls.py --weights saved/fpga/penumbra_unet_best.pth --synth"
     exit 1
 fi
 
@@ -119,7 +119,7 @@ echo "  HLS data files at ${DATA_DIR}"
 # Step 4: Install penumbra.sv (AXI bridge + BRAM + FSM) as the CL top level
 # ---------------------------------------------------------------------------
 
-# cl_top.sv lives alongside this script in fpga/host/ — it defines the
+# cl_top.sv lives alongside this script in hls/host/ — it defines the
 # "penumbra" module that wraps the HLS IP with PCIS/OCL interfaces.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CL_TOP_SRC="${SCRIPT_DIR}/host/cl_top.sv"
